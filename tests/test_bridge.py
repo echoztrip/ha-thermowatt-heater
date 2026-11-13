@@ -159,6 +159,40 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(config['options']['poll_interval'], 300)
         self.assertEqual(config['schema']['poll_interval'], 'int(60,3600)')
 
+    def test_saved_cooldown_publishes_heartbeat_and_retry_without_cloud_io(self):
+        self.b.config['blocked_until'] = bridge.time.time() + 3600
+        self.b.publish_bridge_health(force=True)
+        first = json.loads(self.publications('/health')[-1].args[1])
+        self.assertEqual(first['state'], 'paused')
+        self.assertIsNotNone(first['next_retry'])
+        self.assertEqual(first['reason'], 'saved_cloud_cooldown')
+        self.assertGreater(first['remaining_seconds'], 3590)
+        with patch.object(bridge.time, 'time', return_value=bridge.time.time()+61):
+            self.b.publish_bridge_health()
+        latest = json.loads(self.publications('/health')[-1].args[1])
+        self.assertNotEqual(first['heartbeat'], latest['heartbeat'])
+        self.b.session.request.assert_not_called()
+        self.b.session.post.assert_not_called()
+
+    def test_diagnostics_are_available_independently_of_cloud_availability(self):
+        self.b.publish_bridge_discovery()
+        configs = [json.loads(c.args[1]) for c in self.publications('/config')]
+        self.assertEqual(len(configs), 4)
+        for config in configs:
+            self.assertNotIn('P/main/availability', json.dumps(config))
+            self.assertEqual(config['entity_category'], 'diagnostic')
+        retry = next(c for c in configs if c['unique_id'].endswith('next_retry'))
+        self.assertEqual(retry['availability_mode'], 'all')
+
+    def test_heartbeat_is_throttled_and_running_has_no_retry_date(self):
+        self.b.phase = 'running'
+        self.b.publish_bridge_health(force=True)
+        self.b.publish_bridge_health()
+        self.assertEqual(len(self.publications('/health')), 1)
+        health = json.loads(self.publications('/health')[0].args[1])
+        self.assertEqual(health['state'], 'running')
+        self.assertIsNone(health['next_retry'])
+
     def test_main_loop_polls_both_heaters_without_extra_logins(self):
         self.b.login = MagicMock()
         self.b.session.request.side_effect = [

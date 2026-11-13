@@ -1,5 +1,21 @@
 # Thermowatt bridge reliability repair
 
+## Version 1.3.3: visible cooldown status
+
+The **Thermowatt Bridge** MQTT device exposes Bridge State, Bridge Heartbeat,
+Cooldown Reason and Next Cloud Retry diagnostic sensors. Heartbeat updates
+every minute, including during a saved cooldown; the app log reports the
+remaining pause and UTC retry time immediately after MQTT connection and every
+five minutes. HA displays the timestamp sensor in your local timezone. Next
+Cloud Retry is unavailable when there is no scheduled cooldown.
+
+These updates make no cloud requests. A running MQTT connection does not imply
+that the heaters can currently be reached. The 24-hour daily-limit pause is a
+conservative bridge policy, not a confirmed manufacturer lockout/reset time.
+Upgrading preserves the previously saved deadline rather than starting a new
+24-hour wait. Existing version 1.3.2 pauses display `saved_cloud_cooldown` because
+that version did not save a reason.
+
 Based on this fork's main branch (43b7ed3). Existing water-heater unique IDs,
 discovery topics and diagnostic entities are preserved.
 

@@ -38,6 +38,9 @@ class MyThermowattBridge:
         self.commands = queue.Queue(maxsize=20)
         self.pending_commands = {}
         self.retry_attempt = 0
+        self.phase = "starting"
+        self.last_health_publish = 0
+        self.last_pause_log = 0
         self.mqtt_client.will_set("thermowatt/bridge/availability", "offline", retain=True)
         self.mqtt_client.on_connect = self.on_connect
 
@@ -110,6 +113,8 @@ class MyThermowattBridge:
         if reason_code != 0:
             return
         client.publish("thermowatt/bridge/availability", "online", retain=True)
+        self.publish_bridge_discovery()
+        self.publish_bridge_health(force=True)
         for serial, device in self.config.get("devices", {}).items():
             self.publish_discovery(serial, device["name"])
             self.availability(serial, False)
@@ -119,12 +124,70 @@ class MyThermowattBridge:
         self.mqtt_client.publish(f"P/{serial}/availability",
                                  "online" if available else "offline", retain=True)
 
-    def _pause(self, seconds):
-        self.config["blocked_until"] = max(self.config.get("blocked_until", 0),
-                                            time.time() + seconds)
+    def _pause(self, seconds, reason="bridge_error"):
+        until = time.time() + seconds
+        if until >= self.config.get("blocked_until", 0):
+            self.config["blocked_until"] = until
+            self.config["cooldown_reason"] = reason
         self._save_config()
         for serial in self.config.get("devices", {}):
             self.availability(serial, False)
+        self.publish_bridge_health(force=True)
+
+    def publish_bridge_discovery(self):
+        # Diagnostics depend only on MQTT connectivity, not on cloud readiness.
+        device = {"identifiers": ["thermowatt_bridge"], "name": "Thermowatt Bridge",
+                  "manufacturer": "Thermowatt bridge community fork"}
+        sensors = [
+            ("state", "Bridge State", "{{ value_json.state }}", None),
+            ("next_retry", "Next Cloud Retry", "{{ value_json.next_retry }}", "timestamp"),
+            ("heartbeat", "Bridge Heartbeat", "{{ value_json.heartbeat }}", "timestamp"),
+            ("reason", "Cooldown Reason", "{{ value_json.reason }}", None),
+        ]
+        for key, name, template, device_class in sensors:
+            config = {
+                "unique_id": f"thermowatt_bridge_{key}", "name": name,
+                "state_topic": "thermowatt/bridge/health", "value_template": template,
+                "availability_topic": "thermowatt/bridge/availability",
+                "payload_available": "online", "payload_not_available": "offline",
+                "entity_category": "diagnostic", "device": device,
+            }
+            if device_class:
+                config["device_class"] = device_class
+            # A retry date exists only while a pause is active. Keep this sensor
+            # unavailable in other phases rather than passing null as a timestamp.
+            if key == "next_retry":
+                config["availability"] = [
+                    {"topic": "thermowatt/bridge/availability"},
+                    {"topic": "thermowatt/bridge/health", "value_template":
+                     "{{ 'online' if value_json.next_retry else 'offline' }}"},
+                ]
+                config.pop("availability_topic")
+                config["availability_mode"] = "all"
+                config["value_template"] = "{{ value_json.next_retry or '' }}"
+            self.mqtt_client.publish(f"homeassistant/sensor/thermowatt_bridge_{key}/config",
+                                     json.dumps(config), retain=True)
+
+    def publish_bridge_health(self, force=False):
+        current = time.time()
+        until = self.config.get("blocked_until", 0)
+        paused = current < until
+        if force or current - self.last_health_publish >= 60:
+            health = {
+                "state": "paused" if paused else self.phase,
+                "heartbeat": datetime.datetime.fromtimestamp(current, datetime.timezone.utc).isoformat(),
+                "next_retry": datetime.datetime.fromtimestamp(until, datetime.timezone.utc).isoformat() if paused else None,
+                "reason": self.config.get("cooldown_reason", "saved_cloud_cooldown") if paused else "none",
+                "remaining_seconds": max(0, int(until - current)),
+                "poll_interval": self.POLL_INTERVAL,
+            }
+            self.mqtt_client.publish("thermowatt/bridge/health", json.dumps(health), retain=True)
+            self.last_health_publish = current
+        if paused and (force or current - self.last_pause_log >= self.STATUS_LOG_INTERVAL):
+            retry = datetime.datetime.fromtimestamp(until, datetime.timezone.utc).isoformat()
+            print(f"[COOLDOWN] Bridge alive; no cloud requests. Reason={self.config.get('cooldown_reason', 'saved_cloud_cooldown')}; "
+                  f"retry at {retry}; {max(0, int(until-current))}s remaining", flush=True)
+            self.last_pause_log = current
 
     def _validate(self, response):
         try:
@@ -146,7 +209,7 @@ class MyThermowattBridge:
                         delay = max(delay, parsedate_to_datetime(retry_after).timestamp() - time.time())
                     except (ValueError, TypeError, OverflowError):
                         pass
-            self._pause(delay)
+            self._pause(delay, "daily_request_limit" if daily else "cloud_rate_limit")
             raise RuntimeError(f"Cloud request limit reached; paused for {delay:.0f}s")
         response.raise_for_status()
         if not isinstance(body, dict) or body.get("success") is False:
@@ -531,6 +594,7 @@ class MyThermowattBridge:
         next_poll = 0
         try:
             while True:
+                self.publish_bridge_health()
                 if time.time() < self.config.get("blocked_until", 0):
                     # Drop commands rather than unexpectedly executing them hours later.
                     while not self.commands.empty():
@@ -540,6 +604,8 @@ class MyThermowattBridge:
                     continue
                 try:
                     if not booted:
+                        self.phase = "connecting"
+                        self.publish_bridge_health(force=True)
                         self.login()
                         devices = self.request("GET", "/user-info").json()["result"]["termostati"]
                         if not devices:
@@ -556,6 +622,8 @@ class MyThermowattBridge:
                             self.availability(serial, False)
                             self.mqtt_client.subscribe(f"P/{serial}/CMD/#")
                         booted = True
+                        self.phase = "polling"
+                        self.publish_bridge_health(force=True)
                     # Drain a bounded snapshot; new messages wait until the next iteration.
                     for _ in range(self.commands.qsize()):
                         self.process_command(*self.commands.get_nowait())
@@ -576,6 +644,8 @@ class MyThermowattBridge:
                             self.pending_commands.pop(serial, None)
                         if all_ok:
                             self.retry_attempt = 0
+                        self.phase = "running" if all_ok else "status_error"
+                        self.publish_bridge_health(force=True)
                         if due:
                             next_poll = time.time() + self.POLL_INTERVAL
                     self.log_status_summary()
