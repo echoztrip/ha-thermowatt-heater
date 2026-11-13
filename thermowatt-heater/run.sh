@@ -4,6 +4,8 @@ set -e
 
 EMAIL=$(bashio::config 'email')
 PASSWORD=$(bashio::config 'password')
+export POLL_INTERVAL
+POLL_INTERVAL=$(bashio::config 'poll_interval')
 
 export MQTT_HOST
 export MQTT_PORT

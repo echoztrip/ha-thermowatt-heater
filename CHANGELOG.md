@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.1] - 2026-11-14
+
+- Default to configurable five-minute polling and persist rate-limit cooldowns.
+- Reject cloud error payloads and malformed temperatures; publish availability.
+- Serialize commands, reject retained commands, and remove fabricated status updates.
+- Preserve existing entities and fork diagnostics. Add regression tests and CI.
+- See REPAIR.md for installation, limitations and rollback.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
