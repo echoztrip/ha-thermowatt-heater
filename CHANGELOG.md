@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.2] - 2026-11-14
+
+- Set an explicit Home Assistant base image default for current Supervisor builds.
+- Add an actual amd64 container build and dependency smoke check to CI.
+- Advertise amd64/aarch64, the architectures supported by the current base image.
+
 ## [1.3.1] - 2026-11-14
 
 - Default to configurable five-minute polling and persist rate-limit cooldowns.

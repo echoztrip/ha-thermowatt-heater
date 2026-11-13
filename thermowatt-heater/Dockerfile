@@ -1,5 +1,11 @@
-ARG BUILD_FROM
+ARG BUILD_FROM=ghcr.io/home-assistant/base:3.24
 FROM $BUILD_FROM
+
+ARG BUILD_ARCH
+ARG BUILD_VERSION
+LABEL io.hass.type="app" \
+      io.hass.arch="${BUILD_ARCH}" \
+      io.hass.version="${BUILD_VERSION}"
 
 # Install python and dependencies
 RUN apk add --no-cache python3 py3-pip

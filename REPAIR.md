@@ -37,10 +37,10 @@ discovery topics and diagnostic entities are preserved.
    normally read main, so opening a PR alone will not make the repair installable.
 3. In Settings → Apps → app store/repositories, add your fork's URL if needed:
    `https://github.com/echoztrip/ha-thermowatt-heater`.
-   Identify the fork's version 1.3.1 explicitly; it has the same display name as
+   Identify the fork's version 1.3.2 explicitly; it has the same display name as
    upstream. If HA shows it as a separate app, copy the credentials through the
    configuration UI. Do not run two bridges against the same heaters.
-4. Stop the old Thermowatt app, then start version 1.3.1 with `poll_interval: 300`.
+4. Stop the old Thermowatt app, then start version 1.3.2 with `poll_interval: 300`.
    Keep the old installation stopped for rollback if HA installs the fork separately.
 5. If the vendor daily quota is already exhausted, readings will remain
    unavailable during the saved 24-hour pause. Restarting does not clear it.
@@ -67,4 +67,5 @@ python -m py_compile thermowatt-heater/thermowatt_bridge.py
 ```
 
 Tests use mocked MQTT and HTTP; they never connect to a boiler or use credentials.
-This repair has not been built in a HA container or verified against live heaters.
+CI builds the amd64 container and checks dependencies and the startup interpreter.
+This repair has not been verified against live heaters.
