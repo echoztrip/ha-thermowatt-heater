@@ -1,4 +1,6 @@
 import sys, json, time, uuid, os, requests, urllib3, datetime
+import math, queue
+from email.utils import parsedate_to_datetime
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 
@@ -16,9 +18,8 @@ MQTT_PASS = os.getenv("MQTT_PASSWORD")
 class MyThermowattBridge:
     API_KEY = "YVjArWssxKH631jv1dnnWOTr6gijsSAGz7rQJ4hJoUNRffxYvbQaMbePBEZalena"
     BASE_URL = "https://myapp-connectivity.com/api/v1"
-    POLL_INTERVAL = 20          # seconds
+    POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
     STATUS_LOG_INTERVAL = 300   # 5 minutes
-    STATS_POLL_INTERVAL = 300   # poll energy stats every 5 minutes
 
     def __init__(self):
         self.config = self._load_config()
@@ -32,9 +33,13 @@ class MyThermowattBridge:
         self.success_count = 0
         self.error_count = 0
         self.last_status_log_time = time.time()
-        self.last_stats_poll_time = 0   # force immediate attempt on first run
-        self.rate_limit_backoff = 0
-        self.current_poll_interval = self.POLL_INTERVAL
+        if not 60 <= self.POLL_INTERVAL <= 3600:
+            raise ValueError("POLL_INTERVAL must be from 60 to 3600 seconds")
+        self.commands = queue.Queue(maxsize=20)
+        self.pending_commands = {}
+        self.retry_attempt = 0
+        self.mqtt_client.will_set("thermowatt/bridge/availability", "offline", retain=True)
+        self.mqtt_client.on_connect = self.on_connect
 
     def _load_config(self):
         if os.path.exists(CONFIG_FILE):
@@ -51,8 +56,10 @@ class MyThermowattBridge:
         }
 
     def _save_config(self):
-        with open(CONFIG_FILE, 'w') as f:
+        temporary = CONFIG_FILE + ".tmp"
+        with open(temporary, 'w') as f:
             json.dump(self.config, f)
+        os.replace(temporary, CONFIG_FILE)
 
     def _reset_headers(self):
         auth_header = self.session.headers.get("Authorization")
@@ -72,6 +79,8 @@ class MyThermowattBridge:
         self._save_config()
 
     def login(self):
+        if time.time() < self.config.get("blocked_until", 0):
+            raise RuntimeError("Cloud requests paused after rate limiting")
         self._reset_headers()
         self.session.headers["x-api-key"] = self.API_KEY
         payload = {
@@ -79,35 +88,89 @@ class MyThermowattBridge:
             "password": PASSWORD,
             "device_id": self.config["device_uuid"]
         }
-        r = self.session.post(f"{self.BASE_URL}/login", json=payload, verify=False)
-        r.raise_for_status()
-        res = r.json()['result']
+        r = self.session.post(f"{self.BASE_URL}/login", json=payload, verify=False, timeout=(10, 30))
+        res = self._validate(r)['result']
         self._update_auth(res['accessToken'], res['refreshToken'])
 
     def refresh_session(self):
+        if time.time() < self.config.get("blocked_until", 0):
+            raise RuntimeError("Cloud requests paused after rate limiting")
         self._reset_headers()
         self.session.headers["x-api-key"] = self.API_KEY
         payload = {"username": EMAIL, "refreshToken": self.config["refresh_token"]}
-        r = self.session.post(f"{self.BASE_URL}/refresh", json=payload, verify=False)
+        r = self.session.post(f"{self.BASE_URL}/refresh", json=payload, verify=False, timeout=(10, 30))
         if r.status_code == 200:
-            res = r.json()['result']
+            res = self._validate(r)['result']
             self._update_auth(res['accessToken'], res['refreshToken'])
             return True
+        self._validate(r)
         return False
 
+    def on_connect(self, client, userdata, flags, reason_code, properties):
+        if reason_code != 0:
+            return
+        client.publish("thermowatt/bridge/availability", "online", retain=True)
+        for serial, device in self.config.get("devices", {}).items():
+            self.publish_discovery(serial, device["name"])
+            self.availability(serial, False)
+            client.subscribe(f"P/{serial}/CMD/#")
+
+    def availability(self, serial, available):
+        self.mqtt_client.publish(f"P/{serial}/availability",
+                                 "online" if available else "offline", retain=True)
+
+    def _pause(self, seconds):
+        self.config["blocked_until"] = max(self.config.get("blocked_until", 0),
+                                            time.time() + seconds)
+        self._save_config()
+        for serial in self.config.get("devices", {}):
+            self.availability(serial, False)
+
+    def _validate(self, response):
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        error = str(body.get("error", "")) if isinstance(body, dict) else ""
+        daily = "daily" in error.lower() and "limit" in error.lower()
+        limited = response.status_code == 429 or "limit exceeded" in error.lower()
+        if limited:
+            self.retry_attempt += 1
+            delay = 86400 if daily else min(3600, self.POLL_INTERVAL * 2 ** min(self.retry_attempt, 6))
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    delay = max(delay, float(retry_after))
+                except ValueError:
+                    try:
+                        delay = max(delay, parsedate_to_datetime(retry_after).timestamp() - time.time())
+                    except (ValueError, TypeError, OverflowError):
+                        pass
+            self._pause(delay)
+            raise RuntimeError(f"Cloud request limit reached; paused for {delay:.0f}s")
+        response.raise_for_status()
+        if not isinstance(body, dict) or body.get("success") is False:
+            raise ValueError("Cloud returned an unsuccessful or malformed response")
+        return body
+
     def request(self, method, endpoint, serial=None, **kwargs):
+        # All requests run on the main thread; MQTT callbacks only enqueue commands.
+        if time.time() < self.config.get("blocked_until", 0):
+            raise RuntimeError("Cloud requests paused after rate limiting")
         self._reset_headers()
-        url = f"{self.BASE_URL}{endpoint}"
         if serial:
             self.session.headers["seriale"] = serial
-        resp = self.session.request(method, url, verify=False, **kwargs)
-        if resp.status_code == 401:
-            if self.refresh_session():
-                self._reset_headers()
-                if serial:
-                    self.session.headers["seriale"] = serial
-                resp = self.session.request(method, url, verify=False, **kwargs)
-        return resp
+        kwargs.setdefault("timeout", (10, 30))
+        response = self.session.request(method, f"{self.BASE_URL}{endpoint}",
+                                        verify=False, **kwargs)
+        if response.status_code == 401 and self.refresh_session():
+            self._reset_headers()
+            if serial:
+                self.session.headers["seriale"] = serial
+            response = self.session.request(method, f"{self.BASE_URL}{endpoint}",
+                                            verify=False, **kwargs)
+        self._validate(response)
+        return response
 
     # -------------------------------------------------------------------------
     # MQTT Discovery
@@ -115,6 +178,17 @@ class MyThermowattBridge:
 
     def _pub(self, topic, payload):
         """Helper to publish a retained JSON discovery message."""
+        if "state_topic" in payload or "current_temperature_topic" in payload:
+            serial = payload["device"]["identifiers"][0].removeprefix("tw_")
+            payload["availability"] = [
+                {"topic": "thermowatt/bridge/availability"},
+                {"topic": f"P/{serial}/availability"},
+            ]
+            payload["availability_mode"] = "all"
+            payload["payload_available"] = "online"
+            payload["payload_not_available"] = "offline"
+            if "/sensor/" in topic or "/binary_sensor/" in topic:
+                payload["expire_after"] = self.POLL_INTERVAL * 3
         self.mqtt_client.publish(topic, json.dumps(payload), retain=True)
 
     def _device_block(self, serial, name):
@@ -163,11 +237,11 @@ class MyThermowattBridge:
             "temp_unit": "C",
             "min_temp": 20,
             "max_temp": 75,
-            "optimistic": True,
+            "optimistic": False,
             "current_temperature_topic": f"P/{serial}/STATUS",
-            "current_temperature_template": "{{ value_json.result.T_Avg | default(0) | float }}",
+            "current_temperature_template": "{{ value_json.result.T_Avg | float }}",
             "temperature_state_topic": f"P/{serial}/STATUS",
-            "temperature_state_template": "{{ value_json.result.T_SetPoint | default(0) | float }}",
+            "temperature_state_template": "{{ value_json.result.T_SetPoint | float }}",
             "temperature_command_topic": f"P/{serial}/CMD/TEMP",
             "mode_state_topic": f"P/{serial}/STATUS",
             "mode_state_template": (
@@ -206,7 +280,7 @@ class MyThermowattBridge:
         self._pub_binary(
             serial, name,
             "legionella", "Anti-Legionella Active",
-            "{{ value_json.result.Cmd | default(0) | int == 0 }}",
+            "{{ none }}",
             icon="mdi:bacteria-outline"
         )
 
@@ -323,113 +397,72 @@ class MyThermowattBridge:
     # -------------------------------------------------------------------------
 
     def on_mqtt_message(self, client, userdata, msg):
+        # Never replay retained commands after a restart/reconnect.
+        if msg.retain:
+            return
         try:
-            payload = msg.payload.decode()
             parts = msg.topic.split('/')
-            if len(parts) < 2:
+            if len(parts) != 4 or parts[0] != "P" or parts[2] != "CMD":
                 return
-            sn = parts[1]
-
-            device_config = self.config.get('devices', {}).get(sn, {})
-            if not device_config:
-                print(f"⚠️  Unknown device serial: {sn}")
+            serial, command = parts[1], parts[3]
+            if serial not in self.config.get("devices", {}) or command not in {"TEMP", "MODE"}:
                 return
+            if time.time() < self.config.get("blocked_until", 0):
+                print("[CMD] Rejected while cloud requests are paused")
+                return
+            self.commands.put_nowait((serial, command, msg.payload.decode()))
+        except (UnicodeDecodeError, queue.Full):
+            print("[CMD] Invalid payload or command queue full")
 
-            current_fav = device_config.get("last_setpoint", 60)
-
-            if f"P/{sn}/CMD/TEMP" in msg.topic:
-                temp = int(float(payload))
-                print(f"[CMD] Setting Temperature to {temp}°C for {sn}...")
-                self.request("POST", "/manual", serial=sn, json={"T_SetPoint": temp})
-                device_config["last_setpoint"] = temp
-                self.config['devices'][sn] = device_config
-                self._inject_fake_status(sn, {"T_SetPoint": str(temp)})
-
-            elif f"P/{sn}/CMD/MODE" in msg.topic:
-                print(f"[CMD] Setting Mode to {payload} for {sn}...")
-
-                if payload == "Manual":
-                    self.request("POST", "/manual", serial=sn, json={"T_SetPoint": current_fav})
-                    self._inject_fake_status(sn, {"Cmd": "9", "T_SetPoint": str(current_fav)})
-                elif payload == "Eco":
-                    self.request("POST", "/eco", serial=sn,
-                                 headers={"Content-Type": "text/plain"}, data="")
-                    self._inject_fake_status(sn, {"Cmd": "3"})
-                elif payload == "Auto":
-                    self.request("POST", "/auto", serial=sn,
-                                 headers={"Content-Type": "text/plain"}, data="")
-                    self._inject_fake_status(sn, {"Cmd": "17"})
-                elif payload == "Holiday":
-                    future_date = (datetime.datetime.now() +
-                                   datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-                    print(f"[CMD] Setting Holiday Mode until {future_date} for {sn}...")
-                    self.request("POST", "/holiday", serial=sn,
-                                 json={"end_date": future_date})
-                    self._inject_fake_status(sn, {"Cmd": "65"})
-                elif payload == "Off":
-                    print(f"[CMD] Turning Boiler OFF for {sn}...")
-                    resp = self.request("POST", "/off", serial=sn,
-                                        headers={"Content-Type": "text/plain"}, data="")
-                    self._inject_fake_status(sn, {"Cmd": "16"})
-                    if resp:
-                        print(f"[SUCCESS] Boiler {sn} is now OFF: {resp.text}")
-
-            self._save_config()
-        except Exception as e:
-            print(f"MQTT Cmd Error: {e}")
-
-    # -------------------------------------------------------------------------
-    # Status polling
-    # -------------------------------------------------------------------------
-
-    def _inject_fake_status(self, serial, overrides):
+    def process_command(self, serial, command, payload):
+        device = self.config["devices"][serial]
         try:
-            r = self.request("GET", "/status", serial=serial)
-            status = r.json()
-            mqtt_status = status.get('result', {})
-            for k, v in overrides.items():
-                mqtt_status[k] = str(v)
-            water_heater_sts = int(mqtt_status.get('WaterHeaterSts', 0))
-            mqtt_status['heating'] = (water_heater_sts & 1) != 0
-            self.mqtt_client.publish(f"P/{serial}/STATUS",
-                                     json.dumps(status), retain=True)
-        except Exception as e:
-            print(f"⚠️  Status injection failed for {serial}: {e}")
+            if command == "TEMP":
+                value = float(payload)
+                if not math.isfinite(value) or not value.is_integer() or not 20 <= value <= 75:
+                    raise ValueError("Temperature must be an integer from 20 to 75")
+                self.request("POST", "/manual", serial=serial, json={"T_SetPoint": int(value)})
+                device["last_setpoint"] = int(value)
+            elif payload == "Manual":
+                self.request("POST", "/manual", serial=serial,
+                             json={"T_SetPoint": device.get("last_setpoint", 60)})
+            elif payload in {"Eco", "Auto", "Off"}:
+                self.request("POST", "/" + payload.lower(), serial=serial,
+                             headers={"Content-Type": "text/plain"}, data="")
+            elif payload == "Holiday":
+                end = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+                self.request("POST", "/holiday", serial=serial, json={"end_date": end})
+            else:
+                raise ValueError("Unsupported mode")
+            self._save_config()
+            # Allow the cloud time to reflect the command, without blocking MQTT.
+            self.pending_commands[serial] = time.time() + 20
+            print(f"[CMD] Accepted for {serial}; waiting for a real status update")
+        except Exception as exc:
+            self.availability(serial, False)
+            print(f"[CMD] Failed for {serial}: {exc}")
 
     def poll_status(self, serial):
         try:
-            r = self.request("GET", "/status", serial=serial)
-            status_code = r.status_code
-
-            if status_code == 200:
-                status_data = r.json()
-                if 'result' in status_data:
-                    water_heater_sts = int(
-                        status_data['result'].get('WaterHeaterSts', 0))
-                    status_data['result']['heating'] = (water_heater_sts & 1) != 0
-
-                    # Debug logging for unrecognised Cmd values.
-                    # This is intentionally left in to help identify the
-                    # Anti-Legionella cycle Cmd value. When a legionella cycle
-                    # is running the Cmd value will appear here if it isn't
-                    # already in the known set {3, 9, 16, 17, 65}.
-                    cmd = int(status_data['result'].get('Cmd', 0))
-                    if cmd not in {3, 9, 16, 17, 65}:
-                        print(
-                            f"[DEBUG] Unknown Cmd={cmd} for {serial} — "
-                            f"WaterHeaterSts={water_heater_sts}, "
-                            f"T_Avg={status_data['result'].get('T_Avg')}, "
-                            f"TimeRemaining={status_data['result'].get('TimeRemaining')}"
-                        )
-
-                self.mqtt_client.publish(f"P/{serial}/STATUS",
-                                         json.dumps(status_data), retain=True)
-                return (True, status_code)
-            else:
-                return (False, status_code)
-        except Exception as e:
-            print(f"Poll error for {serial}: {e}")
-            return (False, None)
+            status = self.request("GET", "/status", serial=serial).json()
+            result = status.get("result")
+            if not isinstance(result, dict):
+                raise ValueError("Missing status result")
+            # Do not present absent, non-numeric, or non-finite temperatures as zero.
+            for key in ("T_Avg", "T_SetPoint", "Cmd", "WaterHeaterSts"):
+                if isinstance(result.get(key), bool) or not math.isfinite(float(result[key])):
+                    raise ValueError(f"Invalid {key}")
+            result["heating"] = bool(int(result["WaterHeaterSts"]) & 1)
+            result["last_successful_update"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            self.config["devices"][serial]["last_setpoint"] = int(float(result["T_SetPoint"]))
+            self._save_config()
+            self.mqtt_client.publish(f"P/{serial}/STATUS", json.dumps(status), retain=True)
+            self.availability(serial, True)
+            return True
+        except Exception as exc:
+            self.availability(serial, False)
+            print(f"[STATUS] Failed for {serial}: {exc}")
+            return False
 
     # -------------------------------------------------------------------------
     # Energy/stats polling (stubbed pending endpoint investigation)
@@ -489,121 +522,73 @@ class MyThermowattBridge:
     # -------------------------------------------------------------------------
 
     def run(self):
-        print("--- BOOT SEQUENCE START ---")
-
         if not EMAIL or not PASSWORD:
-            print("FAILED: Step 1 - Missing EMAIL/PASSWORD in addon config.")
-            sys.exit(1)
-        print("OK: Step 1 - Credentials present.")
-
-        try:
-            self.mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
-            print("OK: Step 2 & 3 - Connected and authenticated with local MQTT.")
-        except Exception as e:
-            print(f"FAILED: Step 2/3 - MQTT Connection Error: {e}")
-            sys.exit(1)
-
-        try:
-            self.login()
-            print("OK: Step 4 - Logged in to Thermowatt backend.")
-        except Exception as e:
-            print(f"FAILED: Step 4 - Backend authentication failed: {e}")
-            sys.exit(1)
-
-        try:
-            r = self.request("GET", "/user-info")
-            devices = r.json().get('result', {}).get('termostati', [])
-            if not devices:
-                raise Exception("Zero devices returned")
-
-            if 'devices' not in self.config:
-                self.config['devices'] = {}
-
-            print(f"OK: Step 5 - Found {len(devices)} thermostats.")
-
-            for dev in devices:
-                serial = dev['seriale']
-                name = dev.get('nome', 'Boiler')
-
-                if serial not in self.config['devices']:
-                    self.config['devices'][serial] = {
-                        "name": name, "last_setpoint": 60
-                    }
-                else:
-                    self.config['devices'][serial]["name"] = name
-
-                self.publish_discovery(serial, name)
-                self.mqtt_client.subscribe(f"P/{serial}/CMD/#")
-                print(f"🌉 Bridge active for: {name} ({serial})")
-
-            self._save_config()
-
-        except Exception as e:
-            print(f"FAILED: Step 5 - Could not retrieve thermostat list: {e}")
-            sys.exit(1)
-
-        print("OK: Step 6 - Booted successfully.")
-
+            raise ValueError("Missing email/password in app configuration")
         self.mqtt_client.on_message = self.on_mqtt_message
+        self.mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
         self.mqtt_client.loop_start()
-
-        print(f"OK: Step 7 - Starting polling loop (interval: {self.POLL_INTERVAL}s).")
-
-        while True:
-            try:
-                rate_limited = False
-
-                for serial in self.config.get('devices', {}).keys():
-                    self.poll_count += 1
-                    success, status_code = self.poll_status(serial)
-
-                    if success:
-                        self.success_count += 1
-                        if self.rate_limit_backoff > 0:
-                            self.rate_limit_backoff = 0
-                            self.current_poll_interval = self.POLL_INTERVAL
-                    else:
-                        self.error_count += 1
-                        if status_code == 429:
-                            rate_limited = True
-                            self.rate_limit_backoff += 1
-                            if self.rate_limit_backoff == 1:
-                                self.current_poll_interval = 20
-                            elif self.rate_limit_backoff == 2:
-                                self.current_poll_interval = 40
-                            else:
-                                self.current_poll_interval = 60
-                            print(f"[RATE LIMIT] 429 received, backing off to "
-                                  f"{self.current_poll_interval}s interval")
-                            break
-                        elif status_code is not None:
-                            print(f"[ERROR] Got status {status_code}, re-logging in...")
-                            try:
-                                self.login()
-                            except Exception as e:
-                                print(f"[ERROR] Re-login failed: {e}")
-
-                # Poll energy stats on a slower cadence
-                if time.time() - self.last_stats_poll_time >= self.STATS_POLL_INTERVAL:
-                    for serial in self.config.get('devices', {}).keys():
-                        self.poll_stats(serial)
-                    self.last_stats_poll_time = time.time()
-
-                self.log_status_summary()
-                time.sleep(self.current_poll_interval)
-
-            except KeyboardInterrupt:
-                print("Stopping...")
-                break
-            except Exception as e:
-                print(f"[ERROR] Polling loop error: {e}")
+        booted = False
+        next_poll = 0
+        try:
+            while True:
+                if time.time() < self.config.get("blocked_until", 0):
+                    # Drop commands rather than unexpectedly executing them hours later.
+                    while not self.commands.empty():
+                        self.commands.get_nowait()
+                    self.pending_commands.clear()
+                    time.sleep(1)
+                    continue
                 try:
-                    self.login()
-                except Exception as e2:
-                    print(f"[ERROR] Re-login failed: {e2}")
-                time.sleep(self.current_poll_interval)
-
-        self.mqtt_client.disconnect()
+                    if not booted:
+                        self.login()
+                        devices = self.request("GET", "/user-info").json()["result"]["termostati"]
+                        if not devices:
+                            raise ValueError("No thermostats returned")
+                        active = {}
+                        for item in devices:
+                            serial = str(item["seriale"])
+                            active[serial] = self.config["devices"].get(serial, {})
+                            active[serial]["name"] = item.get("nome", "Boiler")
+                        self.config["devices"] = active
+                        self._save_config()
+                        for serial, device in active.items():
+                            self.publish_discovery(serial, device["name"])
+                            self.availability(serial, False)
+                            self.mqtt_client.subscribe(f"P/{serial}/CMD/#")
+                        booted = True
+                    # Drain a bounded snapshot; new messages wait until the next iteration.
+                    for _ in range(self.commands.qsize()):
+                        self.process_command(*self.commands.get_nowait())
+                    due = time.time() >= next_poll
+                    targets = list(self.config["devices"]) if due else [
+                        serial for serial, when in self.pending_commands.items() if time.time() >= when
+                    ]
+                    if targets:
+                        all_ok = True
+                        for serial in targets:
+                            if time.time() < self.config.get("blocked_until", 0):
+                                break
+                            self.poll_count += 1
+                            ok = self.poll_status(serial)
+                            self.success_count += int(ok)
+                            self.error_count += int(not ok)
+                            all_ok = all_ok and ok
+                            self.pending_commands.pop(serial, None)
+                        if all_ok:
+                            self.retry_attempt = 0
+                        if due:
+                            next_poll = time.time() + self.POLL_INTERVAL
+                    self.log_status_summary()
+                except Exception as exc:
+                    print(f"[BRIDGE] {exc}")
+                    self._pause(self.POLL_INTERVAL)
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.mqtt_client.publish("thermowatt/bridge/availability", "offline", retain=True).wait_for_publish()
+            self.mqtt_client.disconnect()
+            self.mqtt_client.loop_stop()
 
 
 if __name__ == "__main__":
