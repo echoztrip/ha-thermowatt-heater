@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.3] - 2026-11-14
+
+- Publish bridge state, heartbeat, cooldown reason and next retry as MQTT diagnostic sensors.
+- Keep diagnostics available while heater data is unavailable during a cloud pause.
+- Log the saved cooldown immediately after connection and every five minutes while paused.
+- Preserve the existing pause across upgrades; diagnostic updates make no cloud requests.
+
 ## [1.3.2] - 2026-11-14
 
 - Set an explicit Home Assistant base image default for current Supervisor builds.
