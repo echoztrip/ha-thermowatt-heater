@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.5] - 2026-11-15
+
+- Decode Anti-Legionella Active from WaterHeaterSts bit 0x08 instead of
+  leaving the sensor unknown while waiting for a Cmd change.
+- Main's observed cycle cleared this flag at 18:55:45 Sydney on 15 November;
+  Cmd remained Auto (17). This mapping is inferred from firmware 07.00.09.06
+  telemetry correlated with the user's observed cycle, not vendor documentation.
+- Keep operating mode and heating status independent of the cycle flag.
+- Preserve MQTT discovery identities and unknown state for older retained
+  payloads missing the derived field. Add regression tests for the observed
+  cycle, normal heating and invalid status responses.
+
 ## [1.3.4] - 2026-11-15
 
 - Timestamp every Python bridge log with UTC ISO 8601 milliseconds and severity.
@@ -108,4 +120,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.1.1]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.1.0...1.1.1
 [1.1.0]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.0.0...1.1.0
 [1.0.0]: https://github.com/waterheater-dev/ha-thermowatt-heater/releases/tag/1.0.0
-

@@ -392,10 +392,7 @@ class MyThermowattBridge:
                 "{% elif cmd == 17 %}Auto"
                 "{% elif cmd == 65 %}Holiday"
                 "{% elif cmd == 16 %}Off"
-                # TODO: Add Anti-Legionella cmd value once confirmed from device observation.
-                # When a legionella cycle is triggered via the app, watch the raw Cmd value
-                # in the MQTT debug output and add it here, e.g.:
-                # "{% elif cmd == 33 %}Anti-Legionella"
+                # Sanitation is a WaterHeaterSts flag, independent of Cmd/mode.
                 "{% else %}Off{% endif %}"
             ),
             "mode_command_topic": f"P/{serial}/CMD/MODE",
@@ -415,13 +412,13 @@ class MyThermowattBridge:
         )
 
         # ── Anti-Legionella cycle active ──────────────────────────────────────
-        # TODO: Replace 0 with the actual Cmd value once observed from a live cycle.
-        # Trigger a legionella cycle from the app and watch for an unknown Cmd value
-        # in the add-on logs (the poll_status debug logging below will print it).
+        # WaterHeaterSts bit 0x08: observed on Main, firmware 07.00.09.06,
+        # 2026-11-15 17:35-18:50 Sydney; cleared at 18:55:45 (41 -> 33).
+        # Cmd stayed 17 (Auto), and heating stayed true after the flag cleared.
         self._pub_binary(
             serial, name,
             "legionella", "Anti-Legionella Active",
-            "{{ none }}",
+            "{{ value_json.result.anti_legionella_active | default(none) }}",
             icon="mdi:bacteria-outline"
         )
 
@@ -594,6 +591,7 @@ class MyThermowattBridge:
                 if isinstance(result.get(key), bool) or not math.isfinite(float(result[key])):
                     raise ValueError(f"Invalid {key}")
             result["heating"] = bool(int(result["WaterHeaterSts"]) & 1)
+            result["anti_legionella_active"] = bool(int(result["WaterHeaterSts"]) & 0x08)
             result["last_successful_update"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             self.config["devices"][serial]["last_setpoint"] = int(float(result["T_SetPoint"]))
             self._save_config()
@@ -744,4 +742,3 @@ if __name__ == "__main__":
     LOGGER.info("[BRIDGE] Starting Thermowatt Bridge")
     bridge = MyThermowattBridge()
     bridge.run()
-
