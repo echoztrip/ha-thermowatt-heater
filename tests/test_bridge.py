@@ -2,6 +2,7 @@ import importlib.util
 import json
 import io
 import logging
+import re
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -256,6 +257,18 @@ class BridgeTests(unittest.TestCase):
         config = yaml.safe_load((ROOT / 'thermowatt-heater/config.yaml').read_text())
         self.assertEqual(config['options']['poll_interval'], 300)
         self.assertEqual(config['schema']['poll_interval'], 'int(60,3600)')
+
+    def test_app_changelog_covers_current_version_with_short_release_notes(self):
+        config = yaml.safe_load((ROOT / 'thermowatt-heater/config.yaml').read_text())
+        changelog = (ROOT / 'thermowatt-heater/CHANGELOG.md').read_text(encoding='utf-8')
+        sections = re.split(r'^## ', changelog, flags=re.MULTILINE)[1:]
+        self.assertTrue(sections, 'App-folder changelog must contain release notes')
+        self.assertEqual(sections[0].splitlines()[0].strip(), config['version'])
+        for section in sections:
+            with self.subTest(version=section.splitlines()[0]):
+                bullets = re.findall(r'^- .+', section, flags=re.MULTILINE)
+                self.assertGreaterEqual(len(bullets), 1)
+                self.assertLessEqual(len(bullets), 5)
 
     def test_sanitation_cycle_is_independent_of_mode_and_heating(self):
         self.b.publish_discovery('fixture_a', 'Fixture A')
