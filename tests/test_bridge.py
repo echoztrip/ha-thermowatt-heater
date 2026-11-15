@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import io
+import logging
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -45,6 +47,101 @@ class BridgeTests(unittest.TestCase):
     def valid(self):
         return {'success': True, 'result': {'T_Avg': '43.3', 'T_SetPoint': '60',
                                             'Cmd': '9', 'WaterHeaterSts': '1'}}
+
+    def test_log_formatter_uses_utc_with_milliseconds(self):
+        record = logging.LogRecord('test', logging.WARNING, '', 0, 'hello', (), None)
+        record.created = 1794704048.936
+        formatted = bridge.UTCFormatter('%(asctime)s %(levelname)s %(message)s').format(record)
+        self.assertEqual(formatted, '2026-11-15T00:54:08.936Z WARNING hello')
+
+    def test_logging_configuration_is_idempotent_and_timestamps_output(self):
+        handlers = bridge.LOGGER.handlers[:]
+        level, propagate = bridge.LOGGER.level, bridge.LOGGER.propagate
+        self.addCleanup(setattr, bridge.LOGGER, 'handlers', handlers)
+        self.addCleanup(setattr, bridge.LOGGER, 'propagate', propagate)
+        self.addCleanup(bridge.LOGGER.setLevel, level)
+        stream = io.StringIO()
+        with patch.object(bridge.sys, 'stdout', stream):
+            bridge.configure_logging()
+            bridge.configure_logging()
+            bridge.LOGGER.info('[BRIDGE] started')
+        self.assertEqual(len(stream.getvalue().splitlines()), 1)
+        self.assertRegex(stream.getvalue(), r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z INFO \[BRIDGE\] started')
+
+    def test_http_failure_logs_context_duration_without_secrets(self):
+        secret = 'secret-token-do-not-log'
+        self.b.session.request.side_effect = requests.Timeout('https://cloud/?token=' + secret)
+        with self.assertLogs(bridge.LOGGER, level='INFO') as logs, \
+             patch.object(bridge.time, 'monotonic', side_effect=[10, 12.5, 13]):
+            self.assertFalse(self.b.poll_status('extension'))
+        output = '\n'.join(logs.output)
+        self.assertIn('Extension (extension) GET /status; status=none duration=2.500s reason=request timed out', output)
+        self.assertIn('[STATUS] Extension (extension): failed: request timed out', output)
+        self.assertNotIn(secret, output)
+
+    def test_http_200_application_failure_and_recovery_are_distinct(self):
+        secret = 'secret-response-do-not-log'
+        self.b.session.request.return_value = response({'success': False, 'error': secret})
+        with self.assertLogs(bridge.LOGGER, level='INFO') as failed:
+            self.assertFalse(self.b.poll_status('extension'))
+        self.assertIn('status=200', '\n'.join(failed.output))
+        self.assertIn('[STATUS] Extension (extension): failed:', '\n'.join(failed.output))
+        self.assertNotIn(secret, '\n'.join(failed.output))
+        self.b.session.request.return_value = response(self.valid())
+        with self.assertLogs(bridge.LOGGER, level='INFO') as recovered:
+            self.assertTrue(self.b.poll_status('extension'))
+        self.assertIn('[RECOVERY] Extension (extension): fresh status received;', '\n'.join(recovered.output))
+
+    def test_http_error_logs_status_without_response_body(self):
+        self.b.session.request.return_value = response({'error': 'private response'}, 503)
+        with self.assertLogs(bridge.LOGGER, level='INFO') as logs:
+            self.assertFalse(self.b.poll_status('main'))
+        output = '\n'.join(logs.output)
+        self.assertIn('Main (main) GET /status; status=503', output)
+        self.assertIn('reason=HTTP error', output)
+        self.assertNotIn('private response', output)
+        self.assertFalse(self.publications('/STATUS'))
+
+    def test_login_logs_endpoint_without_credentials_or_tokens(self):
+        self.b.session.post.return_value = response({'result': {
+            'accessToken': 'secret-access', 'refreshToken': 'secret-refresh'}})
+        with patch.object(bridge, 'EMAIL', 'private@example.com'), \
+             patch.object(bridge, 'PASSWORD', 'secret-password'), \
+             self.assertLogs(bridge.LOGGER, level='INFO') as logs:
+            self.b.login()
+        output = '\n'.join(logs.output)
+        self.assertIn('Bridge POST /login; status=200', output)
+        for secret in ('private@example.com', 'secret-password', 'secret-access', 'secret-refresh'):
+            self.assertNotIn(secret, output)
+
+    def test_recovery_duration_survives_repeated_failures_and_wall_clock_changes(self):
+        with self.assertLogs(bridge.LOGGER, level='INFO') as logs:
+            self.b.availability('main', True)
+            with patch.object(bridge.time, 'monotonic', return_value=100):
+                self.b.availability('main', False)
+            with patch.object(bridge.time, 'monotonic', return_value=250):
+                self.b.availability('main', False)
+            with patch.object(bridge.time, 'monotonic', return_value=402.5), \
+                 patch.object(bridge.time, 'time', return_value=1):
+                self.b.availability('main', True)
+            self.b.availability('main', True)
+        self.assertEqual(sum('data unavailable' in line and '[AVAILABILITY]' in line for line in logs.output), 1)
+        self.assertEqual(sum('[RECOVERY]' in line for line in logs.output), 1)
+        self.assertIn('data unavailable for 302.5s', '\n'.join(logs.output))
+
+    def test_auth_retry_logs_each_http_attempt_without_credentials(self):
+        self.b.session.request.side_effect = [response({}, 401), response(self.valid())]
+        self.b.session.post.return_value = response({'result': {
+            'accessToken': 'secret-access', 'refreshToken': 'secret-refresh'}})
+        self.b.config['refresh_token'] = 'secret-refresh'
+        with self.assertLogs(bridge.LOGGER, level='INFO') as logs:
+            self.assertTrue(self.b.poll_status('main'))
+        output = '\n'.join(logs.output)
+        self.assertEqual(sum('[HTTP]' in line for line in logs.output), 3)
+        self.assertIn('status=401', output)
+        self.assertIn('POST /refresh; status=200', output)
+        self.assertNotIn('secret-access', output)
+        self.assertNotIn('secret-refresh', output)
 
     def test_daily_limit_in_http_200_preserves_status_and_blocks_all_requests(self):
         self.b.session.request.return_value = response({'success': False, 'error': 'Daily request limit exceeded'})
@@ -223,3 +320,4 @@ class BridgeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

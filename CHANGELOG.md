@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.3.4] - 2026-11-15
+
+- Timestamp every Python bridge log with UTC ISO 8601 milliseconds and severity.
+- Log each cloud HTTP attempt with boiler name/serial where applicable, endpoint,
+  HTTP status, duration and safe failure category; never log payloads or raw request exceptions.
+- Log availability transitions and recovery duration once per interruption, using
+  a monotonic clock. Durations cover this bridge process only.
+- Replace the misleading "x 200" summary with counts of valid status updates.
+- Remove the account email from the startup message and add logging regression tests.
+
 ## [1.3.3] - 2026-11-14
 
 - Publish bridge state, heartbeat, cooldown reason and next retry as MQTT diagnostic sensors.
@@ -98,3 +108,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.1.1]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.1.0...1.1.1
 [1.1.0]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.0.0...1.1.0
 [1.0.0]: https://github.com/waterheater-dev/ha-thermowatt-heater/releases/tag/1.0.0
+

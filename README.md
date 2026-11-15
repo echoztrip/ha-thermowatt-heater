@@ -35,31 +35,30 @@ Once the add-on is running, a new entity will appear under your MQTT integration
 
 ## Troubleshooting
 
-The add-on will log each step of its boot cycle, so that in case of a problem, you will be aware of exactly which step failed. A healthy log should look like this:
+Since 1.3.4, Python bridge logs use UTC ISO 8601 timestamps with milliseconds
+and a severity level. Match these to Home Assistant history by converting UTC
+to your local timezone (Sydney daylight time is UTC+11).
+
+Each HTTP attempt logs the method, endpoint, HTTP status and elapsed seconds.
+Device requests include the boiler name and serial. HTTP 200 means a response
+arrived; a following `[STATUS] ... failed` still means its contents were rejected.
+Request/response bodies, credentials, tokens and raw request exceptions are not logged.
+
+For example, a failed status poll followed by recovery looks like:
 
 ```code
-s6-rc: info: service s6rc-oneshot-runner: starting
-s6-rc: info: service s6rc-oneshot-runner successfully started
-s6-rc: info: service fix-attrs: starting
-s6-rc: info: service fix-attrs successfully started
-s6-rc: info: service legacy-cont-init: starting
-s6-rc: info: service legacy-cont-init successfully started
-s6-rc: info: service legacy-services: starting
-s6-rc: info: service legacy-services successfully started
-[21:51:03] INFO: Starting Thermowatt Bridge for <email@example.com>...
---- BOOT SEQUENCE START ---
-OK: Step 1 - Credentials present.
-OK: Step 2 & 3 - Connected and authenticated with local MQTT.
-OK: Step 4 - Logged in to Thermowatt backend.
-OK: Step 5 - Found 1 thermostats.
-🌉 Bridge active for: Home (3012340231805353)
-OK: Step 6 - Booted successfully.
-OK: Step 7 - Starting polling loop (interval: 20s).
-[STATUS] Polled 16 times, got 16 x 200, 0 errors
-[STATUS] Polled 15 times, got 15 x 200, 0 errors
-[STATUS] Polled 15 times, got 15 x 200, 0 errors
-[STATUS] Polled 15 times, got 15 x 200, 0 errors
+2026-11-15T00:52:08.936Z INFO [HTTP] Extension (example-serial) GET /status; status=200 duration=0.825s reason=response received
+2026-11-15T00:52:08.937Z WARNING [AVAILABILITY] Extension (example-serial): data unavailable
+2026-11-15T00:52:08.937Z WARNING [STATUS] Extension (example-serial): failed: unsuccessful or malformed cloud response / invalid value
+2026-11-15T00:57:11.419Z INFO [HTTP] Extension (example-serial) GET /status; status=200 duration=0.740s reason=response received
+2026-11-15T00:57:11.420Z INFO [RECOVERY] Extension (example-serial): fresh status received; data unavailable for 302.5s
 ```
+
+Availability/recovery messages appear once per transition, including startup and
+MQTT reconnection. The duration starts when this process publishes the first
+offline state, uses a monotonic clock, and does not survive a bridge restart.
+It measures unavailable bridge data, not a confirmed physical heater outage.
+Container service-manager output may keep its own format.
 
 ## Known to work on:
 
@@ -85,3 +84,4 @@ _Disclaimer: This project is not affiliated with or endorsed by Thermowatt or Ar
 If this add-on saved you some frustration or made your home a bit smarter or helped someone avoid a cold shower, feel free to [buy me a beer on Ko-fi!](https://ko-fi.com/thermohacker)
 
 [![support](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/thermohacker)
+
