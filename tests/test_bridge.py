@@ -256,6 +256,61 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(config['options']['poll_interval'], 300)
         self.assertEqual(config['schema']['poll_interval'], 'int(60,3600)')
 
+    def test_observed_sanitation_cycle_is_independent_of_mode_and_heating(self):
+        self.b.publish_discovery('main', 'Main')
+        configs = {c.args[0]: json.loads(c.args[1]) for c in self.publications('/config')}
+        cycle = configs['homeassistant/binary_sensor/main_legionella/config']
+        self.assertEqual(cycle['unique_id'], 'thermowatt_main_legionella')
+        env = jinja2.Environment()
+        cycle_template = env.from_string(cycle['value_template'])
+        mode_template = env.from_string(configs['homeassistant/water_heater/main/config']['mode_state_template'])
+        # Main, 15 Nov 2026 Sydney: 17:30 idle, 17:35/18:50 cycle,
+        # 18:55:45 flag cleared although the element still reported heating.
+        for status, temperature, desired, active, heating in (
+            ('32', '37', '35', False, False),
+            ('41', '38', '70', True, True),
+            ('41', '65', '70', True, True),
+            ('33', '66', '70', False, True),
+        ):
+            with self.subTest(status=status, temperature=temperature):
+                body = self.valid()
+                body['result'].update(Cmd='17', WaterHeaterSts=status,
+                                      T_Avg=temperature, T_dsrd=desired)
+                self.b.session.request.return_value = response(body)
+                self.assertTrue(self.b.poll_status('main'))
+                published = json.loads(self.publications('/STATUS')[-1].args[1])
+                self.assertIs(published['result']['anti_legionella_active'], active)
+                self.assertIs(published['result']['heating'], heating)
+                self.assertEqual(cycle_template.render(value_json=published), cycle['payload_on'] if active else cycle['payload_off'])
+                self.assertEqual(mode_template.render(value_json=published), 'Auto')
+        # A pre-upgrade retained payload has no decoded field: stay unknown.
+        self.assertEqual(cycle_template.render(value_json=self.valid()), 'None')
+
+    def test_sanitation_flag_ignores_command_and_unrelated_status_bits(self):
+        for status, active, heating in ((0, False, False), (1, False, True),
+                                        (8, True, False), (9, True, True),
+                                        (96, False, False), (97, False, True),
+                                        (105, True, True)):
+            for cmd in ('9', '17'):
+                with self.subTest(status=status, cmd=cmd):
+                    body = self.valid()
+                    body['result'].update(WaterHeaterSts=str(status), Cmd=cmd)
+                    self.b.session.request.return_value = response(body)
+                    self.assertTrue(self.b.poll_status('main'))
+                    published = json.loads(self.publications('/STATUS')[-1].args[1])['result']
+                    self.assertIs(published['anti_legionella_active'], active)
+                    self.assertIs(published['heating'], heating)
+
+    def test_invalid_status_flag_does_not_publish_a_false_cycle_state(self):
+        for invalid in (None, True, 'nan', 'bad'):
+            with self.subTest(invalid=invalid):
+                body = self.valid()
+                body['result']['WaterHeaterSts'] = invalid
+                self.b.session.request.return_value = response(body)
+                self.assertFalse(self.b.poll_status('main'))
+                self.assertFalse(self.publications('/STATUS'))
+                self.assertEqual(self.publications('/availability')[-1].args[1], 'offline')
+
     def test_saved_cooldown_publishes_heartbeat_and_retry_without_cloud_io(self):
         self.b.config['blocked_until'] = bridge.time.time() + 3600
         self.b.publish_bridge_health(force=True)
@@ -320,4 +375,3 @@ class BridgeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-
