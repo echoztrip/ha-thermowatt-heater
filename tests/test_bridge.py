@@ -35,8 +35,9 @@ class BridgeTests(unittest.TestCase):
         patch.object(bridge, 'CONFIG_FILE', self.path).start()
         patch.object(bridge.mqtt, 'Client', return_value=MagicMock()).start()
         self.b = bridge.MyThermowattBridge()
-        self.b.config['devices'] = {'main': {'name': 'Main', 'last_setpoint': 60},
-                                    'extension': {'name': 'Extension'}}
+        # Synthetic identities for protocol tests; unrelated to any installation.
+        self.b.config['devices'] = {'fixture_a': {'name': 'Fixture A', 'last_setpoint': 60},
+                                    'fixture_b': {'name': 'Fixture B'}}
         self.b.session = MagicMock()
         self.b.session.headers = {}
 
@@ -50,9 +51,9 @@ class BridgeTests(unittest.TestCase):
 
     def test_log_formatter_uses_utc_with_milliseconds(self):
         record = logging.LogRecord('test', logging.WARNING, '', 0, 'hello', (), None)
-        record.created = 1794704048.936
+        record.created = 946684800.125
         formatted = bridge.UTCFormatter('%(asctime)s %(levelname)s %(message)s').format(record)
-        self.assertEqual(formatted, '2026-11-15T00:54:08.936Z WARNING hello')
+        self.assertEqual(formatted, '2000-01-01T00:00:00.125Z WARNING hello')
 
     def test_logging_configuration_is_idempotent_and_timestamps_output(self):
         handlers = bridge.LOGGER.handlers[:]
@@ -73,31 +74,31 @@ class BridgeTests(unittest.TestCase):
         self.b.session.request.side_effect = requests.Timeout('https://cloud/?token=' + secret)
         with self.assertLogs(bridge.LOGGER, level='INFO') as logs, \
              patch.object(bridge.time, 'monotonic', side_effect=[10, 12.5, 13]):
-            self.assertFalse(self.b.poll_status('extension'))
+            self.assertFalse(self.b.poll_status('fixture_b'))
         output = '\n'.join(logs.output)
-        self.assertIn('Extension (extension) GET /status; status=none duration=2.500s reason=request timed out', output)
-        self.assertIn('[STATUS] Extension (extension): failed: request timed out', output)
+        self.assertIn('Fixture B (fixture_b) GET /status; status=none duration=2.500s reason=request timed out', output)
+        self.assertIn('[STATUS] Fixture B (fixture_b): failed: request timed out', output)
         self.assertNotIn(secret, output)
 
     def test_http_200_application_failure_and_recovery_are_distinct(self):
         secret = 'secret-response-do-not-log'
         self.b.session.request.return_value = response({'success': False, 'error': secret})
         with self.assertLogs(bridge.LOGGER, level='INFO') as failed:
-            self.assertFalse(self.b.poll_status('extension'))
+            self.assertFalse(self.b.poll_status('fixture_b'))
         self.assertIn('status=200', '\n'.join(failed.output))
-        self.assertIn('[STATUS] Extension (extension): failed:', '\n'.join(failed.output))
+        self.assertIn('[STATUS] Fixture B (fixture_b): failed:', '\n'.join(failed.output))
         self.assertNotIn(secret, '\n'.join(failed.output))
         self.b.session.request.return_value = response(self.valid())
         with self.assertLogs(bridge.LOGGER, level='INFO') as recovered:
-            self.assertTrue(self.b.poll_status('extension'))
-        self.assertIn('[RECOVERY] Extension (extension): fresh status received;', '\n'.join(recovered.output))
+            self.assertTrue(self.b.poll_status('fixture_b'))
+        self.assertIn('[RECOVERY] Fixture B (fixture_b): fresh status received;', '\n'.join(recovered.output))
 
     def test_http_error_logs_status_without_response_body(self):
         self.b.session.request.return_value = response({'error': 'private response'}, 503)
         with self.assertLogs(bridge.LOGGER, level='INFO') as logs:
-            self.assertFalse(self.b.poll_status('main'))
+            self.assertFalse(self.b.poll_status('fixture_a'))
         output = '\n'.join(logs.output)
-        self.assertIn('Main (main) GET /status; status=503', output)
+        self.assertIn('Fixture A (fixture_a) GET /status; status=503', output)
         self.assertIn('reason=HTTP error', output)
         self.assertNotIn('private response', output)
         self.assertFalse(self.publications('/STATUS'))
@@ -116,15 +117,15 @@ class BridgeTests(unittest.TestCase):
 
     def test_recovery_duration_survives_repeated_failures_and_wall_clock_changes(self):
         with self.assertLogs(bridge.LOGGER, level='INFO') as logs:
-            self.b.availability('main', True)
+            self.b.availability('fixture_a', True)
             with patch.object(bridge.time, 'monotonic', return_value=100):
-                self.b.availability('main', False)
+                self.b.availability('fixture_a', False)
             with patch.object(bridge.time, 'monotonic', return_value=250):
-                self.b.availability('main', False)
+                self.b.availability('fixture_a', False)
             with patch.object(bridge.time, 'monotonic', return_value=402.5), \
                  patch.object(bridge.time, 'time', return_value=1):
-                self.b.availability('main', True)
-            self.b.availability('main', True)
+                self.b.availability('fixture_a', True)
+            self.b.availability('fixture_a', True)
         self.assertEqual(sum('data unavailable' in line and '[AVAILABILITY]' in line for line in logs.output), 1)
         self.assertEqual(sum('[RECOVERY]' in line for line in logs.output), 1)
         self.assertIn('data unavailable for 302.5s', '\n'.join(logs.output))
@@ -135,7 +136,7 @@ class BridgeTests(unittest.TestCase):
             'accessToken': 'secret-access', 'refreshToken': 'secret-refresh'}})
         self.b.config['refresh_token'] = 'secret-refresh'
         with self.assertLogs(bridge.LOGGER, level='INFO') as logs:
-            self.assertTrue(self.b.poll_status('main'))
+            self.assertTrue(self.b.poll_status('fixture_a'))
         output = '\n'.join(logs.output)
         self.assertEqual(sum('[HTTP]' in line for line in logs.output), 3)
         self.assertIn('status=401', output)
@@ -145,13 +146,13 @@ class BridgeTests(unittest.TestCase):
 
     def test_daily_limit_in_http_200_preserves_status_and_blocks_all_requests(self):
         self.b.session.request.return_value = response({'success': False, 'error': 'Daily request limit exceeded'})
-        self.assertFalse(self.b.poll_status('main'))
+        self.assertFalse(self.b.poll_status('fixture_a'))
         self.assertFalse(self.publications('/STATUS'))
         self.assertGreater(self.b.config['blocked_until'], bridge.time.time() + 86390)
-        self.assertFalse(self.b.poll_status('extension'))
+        self.assertFalse(self.b.poll_status('fixture_b'))
         self.assertEqual(self.b.session.request.call_count, 1)
         offline = {c.args[0] for c in self.publications('/availability') if c.args[1] == 'offline'}
-        self.assertEqual(offline, {'P/main/availability', 'P/extension/availability'})
+        self.assertEqual(offline, {'P/fixture_a/availability', 'P/fixture_b/availability'})
         # Restarting preserves the pause; login also cannot bypass it.
         restarted = bridge.MyThermowattBridge()
         restarted.session = MagicMock()
@@ -173,13 +174,13 @@ class BridgeTests(unittest.TestCase):
 
     def test_valid_reading_publishes_real_temperatures_and_heating(self):
         self.b.session.request.return_value = response(self.valid())
-        self.assertTrue(self.b.poll_status('main'))
+        self.assertTrue(self.b.poll_status('fixture_a'))
         status = json.loads(self.publications('/STATUS')[0].args[1])['result']
         self.assertEqual(status['T_Avg'], '43.3')
         self.assertEqual(status['T_SetPoint'], '60')
         self.assertTrue(status['heating'])
         self.assertIn('last_successful_update', status)
-        self.assertEqual(self.b.config['devices']['main']['last_setpoint'], 60)
+        self.assertEqual(self.b.config['devices']['fixture_a']['last_setpoint'], 60)
         self.assertEqual(self.publications('/availability')[-1].args[1], 'online')
 
     def test_bad_status_never_publishes_zero_or_replaces_retained_reading(self):
@@ -189,44 +190,44 @@ class BridgeTests(unittest.TestCase):
                      {'result': dict(self.valid()['result'], T_SetPoint=True)}):
             with self.subTest(body=body):
                 self.b.session.request.return_value = response(body)
-                self.assertFalse(self.b.poll_status('main'))
+                self.assertFalse(self.b.poll_status('fixture_a'))
                 self.assertFalse(self.publications('/STATUS'))
 
     def test_timeout_marks_unavailable(self):
         self.b.session.request.side_effect = requests.Timeout()
-        self.assertFalse(self.b.poll_status('main'))
+        self.assertFalse(self.b.poll_status('fixture_a'))
         self.assertEqual(self.publications('/availability')[-1].args[1], 'offline')
         self.assertEqual(self.b.session.request.call_args.kwargs['timeout'], (10, 30))
 
     def test_rejected_command_never_fakes_success(self):
         self.b.session.request.return_value = response({'success': False, 'error': 'Wrong mode'})
-        self.b.process_command('main', 'TEMP', '55')
-        self.assertEqual(self.b.config['devices']['main']['last_setpoint'], 60)
+        self.b.process_command('fixture_a', 'TEMP', '55')
+        self.assertEqual(self.b.config['devices']['fixture_a']['last_setpoint'], 60)
         self.assertFalse(self.b.pending_commands)
         self.assertFalse(self.publications('/STATUS'))
 
     def test_accepted_command_waits_for_real_status(self):
         self.b.session.request.return_value = response({'success': True})
-        self.b.process_command('main', 'TEMP', '55')
-        self.assertEqual(self.b.config['devices']['main']['last_setpoint'], 55)
-        self.assertIn('main', self.b.pending_commands)
+        self.b.process_command('fixture_a', 'TEMP', '55')
+        self.assertEqual(self.b.config['devices']['fixture_a']['last_setpoint'], 55)
+        self.assertIn('fixture_a', self.b.pending_commands)
         self.assertFalse(self.publications('/STATUS'))
-        self.assertGreater(self.b.pending_commands['main'], bridge.time.time() + 19)
+        self.assertGreater(self.b.pending_commands['fixture_a'], bridge.time.time() + 19)
         self.assertEqual(self.b.session.request.call_count, 1)
 
     def test_invalid_commands_do_not_reach_cloud(self):
         for payload in ('nan', 'inf', '19', '76', '55.5', 'garbage'):
-            self.b.process_command('main', 'TEMP', payload)
-        self.b.process_command('main', 'MODE', 'unsupported')
+            self.b.process_command('fixture_a', 'TEMP', payload)
+        self.b.process_command('fixture_a', 'MODE', 'unsupported')
         self.b.session.request.assert_not_called()
 
     def test_mqtt_callback_queues_without_cloud_io_and_rejects_retained(self):
-        msg = SimpleNamespace(topic='P/main/CMD/TEMP', payload=b'55', retain=True)
+        msg = SimpleNamespace(topic='P/fixture_a/CMD/TEMP', payload=b'55', retain=True)
         self.b.on_mqtt_message(None, None, msg)
         self.assertTrue(self.b.commands.empty())
         msg.retain = False
         self.b.on_mqtt_message(None, None, msg)
-        self.assertEqual(self.b.commands.get_nowait(), ('main', 'TEMP', '55'))
+        self.assertEqual(self.b.commands.get_nowait(), ('fixture_a', 'TEMP', '55'))
         self.b.session.request.assert_not_called()
 
     def test_reconnect_resubscribes_and_requires_fresh_status(self):
@@ -235,10 +236,10 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.publications('/availability')[-1].args[1], 'offline')
 
     def test_discovery_keeps_identity_and_templates_compile(self):
-        self.b.publish_discovery('main', 'Main')
+        self.b.publish_discovery('fixture_a', 'Fixture A')
         configs = {c.args[0]: json.loads(c.args[1]) for c in self.publications('/config')}
-        heater = configs['homeassistant/water_heater/main/config']
-        self.assertEqual(heater['unique_id'], 'thermowatt_main_v314')
+        heater = configs['homeassistant/water_heater/fixture_a/config']
+        self.assertEqual(heater['unique_id'], 'thermowatt_fixture_a_v314')
         self.assertFalse(heater['optimistic'])
         self.assertEqual(heater['availability_mode'], 'all')
         env = jinja2.Environment()
@@ -256,28 +257,27 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(config['options']['poll_interval'], 300)
         self.assertEqual(config['schema']['poll_interval'], 'int(60,3600)')
 
-    def test_observed_sanitation_cycle_is_independent_of_mode_and_heating(self):
-        self.b.publish_discovery('main', 'Main')
+    def test_sanitation_cycle_is_independent_of_mode_and_heating(self):
+        self.b.publish_discovery('fixture_a', 'Fixture A')
         configs = {c.args[0]: json.loads(c.args[1]) for c in self.publications('/config')}
-        cycle = configs['homeassistant/binary_sensor/main_legionella/config']
-        self.assertEqual(cycle['unique_id'], 'thermowatt_main_legionella')
+        cycle = configs['homeassistant/binary_sensor/fixture_a_legionella/config']
+        self.assertEqual(cycle['unique_id'], 'thermowatt_fixture_a_legionella')
         env = jinja2.Environment()
         cycle_template = env.from_string(cycle['value_template'])
-        mode_template = env.from_string(configs['homeassistant/water_heater/main/config']['mode_state_template'])
-        # Main, 15 Nov 2026 Sydney: 17:30 idle, 17:35/18:50 cycle,
-        # 18:55:45 flag cleared although the element still reported heating.
+        mode_template = env.from_string(configs['homeassistant/water_heater/fixture_a/config']['mode_state_template'])
+        # Synthetic protocol cases: idle, active cycle, then heating without a cycle.
         for status, temperature, desired, active, heating in (
-            ('32', '37', '35', False, False),
-            ('41', '38', '70', True, True),
-            ('41', '65', '70', True, True),
-            ('33', '66', '70', False, True),
+            ('32', '40', '45', False, False),
+            ('41', '50', '70', True, True),
+            ('41', '60', '70', True, True),
+            ('33', '65', '70', False, True),
         ):
             with self.subTest(status=status, temperature=temperature):
                 body = self.valid()
                 body['result'].update(Cmd='17', WaterHeaterSts=status,
                                       T_Avg=temperature, T_dsrd=desired)
                 self.b.session.request.return_value = response(body)
-                self.assertTrue(self.b.poll_status('main'))
+                self.assertTrue(self.b.poll_status('fixture_a'))
                 published = json.loads(self.publications('/STATUS')[-1].args[1])
                 self.assertIs(published['result']['anti_legionella_active'], active)
                 self.assertIs(published['result']['heating'], heating)
@@ -296,7 +296,7 @@ class BridgeTests(unittest.TestCase):
                     body = self.valid()
                     body['result'].update(WaterHeaterSts=str(status), Cmd=cmd)
                     self.b.session.request.return_value = response(body)
-                    self.assertTrue(self.b.poll_status('main'))
+                    self.assertTrue(self.b.poll_status('fixture_a'))
                     published = json.loads(self.publications('/STATUS')[-1].args[1])['result']
                     self.assertIs(published['anti_legionella_active'], active)
                     self.assertIs(published['heating'], heating)
@@ -307,7 +307,7 @@ class BridgeTests(unittest.TestCase):
                 body = self.valid()
                 body['result']['WaterHeaterSts'] = invalid
                 self.b.session.request.return_value = response(body)
-                self.assertFalse(self.b.poll_status('main'))
+                self.assertFalse(self.b.poll_status('fixture_a'))
                 self.assertFalse(self.publications('/STATUS'))
                 self.assertEqual(self.publications('/availability')[-1].args[1], 'offline')
 
@@ -331,7 +331,7 @@ class BridgeTests(unittest.TestCase):
         configs = [json.loads(c.args[1]) for c in self.publications('/config')]
         self.assertEqual(len(configs), 4)
         for config in configs:
-            self.assertNotIn('P/main/availability', json.dumps(config))
+            self.assertNotIn('P/fixture_a/availability', json.dumps(config))
             self.assertEqual(config['entity_category'], 'diagnostic')
         retry = next(c for c in configs if c['unique_id'].endswith('next_retry'))
         self.assertEqual(retry['availability_mode'], 'all')
@@ -345,25 +345,32 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(health['state'], 'running')
         self.assertIsNone(health['next_retry'])
 
-    def test_main_loop_polls_both_heaters_without_extra_logins(self):
-        self.b.login = MagicMock()
-        self.b.session.request.side_effect = [
-            response({'success': True, 'result': {'termostati': [
-                {'seriale': 'main', 'nome': 'Main'}, {'seriale': 'extension', 'nome': 'Extension'}]}}),
-            response(self.valid()), response(self.valid()),
-        ]
-        with patch.object(bridge, 'EMAIL', 'test'), patch.object(bridge, 'PASSWORD', 'test'), \
-             patch.object(bridge.time, 'sleep', side_effect=KeyboardInterrupt):
-            self.b.run()
-        self.b.login.assert_called_once()
-        self.assertEqual(self.b.session.request.call_count, 3)
-        self.assertEqual(len(self.publications('/STATUS')), 2)
+    def test_main_loop_discovers_arbitrary_device_counts_without_extra_logins(self):
+        for count in (1, 3, 5):
+            with self.subTest(device_count=count):
+                self.b.login = MagicMock()
+                self.b.mqtt_client.reset_mock()
+                self.b.session.request.reset_mock()
+                devices = [{'seriale': f'fixture_{index}', 'nome': f'Fixture {index}'}
+                           for index in range(count)]
+                self.b.session.request.side_effect = [
+                    response({'success': True, 'result': {'termostati': devices}}),
+                    *[response(self.valid()) for _ in devices],
+                ]
+                with patch.object(bridge, 'EMAIL', 'test'), patch.object(bridge, 'PASSWORD', 'test'), \
+                     patch.object(bridge.time, 'sleep', side_effect=KeyboardInterrupt):
+                    self.b.run()
+                self.b.login.assert_called_once()
+                self.assertEqual(self.b.session.request.call_count, count + 1)
+                self.assertEqual(len(self.publications('/STATUS')), count)
+                self.assertEqual(set(self.b.config['devices']),
+                                 {device['seriale'] for device in devices})
 
-    def test_main_loop_quota_error_stops_before_second_heater(self):
+    def test_main_loop_quota_error_stops_remaining_device_requests(self):
         self.b.login = MagicMock()
         self.b.session.request.side_effect = [
             response({'success': True, 'result': {'termostati': [
-                {'seriale': 'main'}, {'seriale': 'extension'}]}}),
+                {'seriale': 'fixture_a'}, {'seriale': 'fixture_b'}]}}),
             response({'success': False, 'error': 'Daily request limit exceeded'}),
         ]
         with patch.object(bridge, 'EMAIL', 'test'), patch.object(bridge, 'PASSWORD', 'test'), \
@@ -374,4 +381,4 @@ class BridgeTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    unittest.fixture_a()

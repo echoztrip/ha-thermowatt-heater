@@ -412,9 +412,8 @@ class MyThermowattBridge:
         )
 
         # ── Anti-Legionella cycle active ──────────────────────────────────────
-        # WaterHeaterSts bit 0x08: observed on Main, firmware 07.00.09.06,
-        # 2026-11-15 17:35-18:50 Sydney; cleared at 18:55:45 (41 -> 33).
-        # Cmd stayed 17 (Auto), and heating stayed true after the flag cleared.
+        # WaterHeaterSts bit 0x08 is inferred from telemetry on firmware 07.00.09.06,
+        # not vendor documentation. Mode and heating are independent of this flag.
         self._pub_binary(
             serial, name,
             "legionella", "Anti-Legionella Active",
