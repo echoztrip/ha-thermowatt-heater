@@ -25,3 +25,8 @@ Thumbs.db
 # --- Sensitive Environment Files ---
 .env
 .flaskenv
+
+# Local bridge credentials, tokens and discovered devices
+thermowatt_config.json
+thermowatt_config.json.tmp
+

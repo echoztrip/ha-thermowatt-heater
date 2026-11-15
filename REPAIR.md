@@ -22,13 +22,14 @@ discovery topics and diagnostic entities are preserved.
 ## Changes
 
 - Configurable `poll_interval`, default 300 seconds per heater (60–3600 allowed).
-  Two heaters now use about 576 scheduled status calls per day, plus startup,
-  token refresh and command follow-up calls. The vendor quota is unknown.
+  Scheduled status calls per day are approximately
+  `device_count * 86400 / poll_interval`, plus startup, token refresh and
+  command follow-up calls. The vendor quota is unknown.
 - HTTP 200 responses containing `success: false` are failures, not status updates.
   A daily-limit response pauses all cloud activity for 24 hours; the actual vendor
   reset time is unknown. The pause is saved in the app's data and survives restart.
   HTTP 429 uses increasing waits and respects a longer Retry-After value.
-- Error payloads never replace retained successful status. Both heaters become
+- Error payloads never replace retained successful status. All discovered devices become
   unavailable during an account-level pause. Individual failed polls mark that
   heater unavailable until its next valid response. MQTT last-will marks the
   bridge unavailable if it disconnects. Reconnect requires fresh status.
@@ -55,7 +56,7 @@ discovery topics and diagnostic entities are preserved.
    `https://github.com/echoztrip/ha-thermowatt-heater`.
    Identify the fork's version 1.3.2 explicitly; it has the same display name as
    upstream. If HA shows it as a separate app, copy the credentials through the
-   configuration UI. Do not run two bridges against the same heaters.
+   configuration UI. Do not run multiple bridges against the same account.
 4. Stop the old Thermowatt app, then start version 1.3.2 with `poll_interval: 300`.
    Keep the old installation stopped for rollback if HA installs the fork separately.
 5. If the vendor daily quota is already exhausted, readings will remain
@@ -64,9 +65,9 @@ discovery topics and diagnostic entities are preserved.
    with the vendor app. They map to T_Avg and T_SetPoint respectively. Neither
    should be substituted for the other.
 7. Send one deliberate command during normal use. Confirm a subsequent real
-   status update and check the matching Shelly channel for actual heating power.
+   status update and, if available, use independent power monitoring to verify heating.
    Cloud acceptance alone does not prove that the element is running.
-8. Check both heaters keep updating over a full day without request-limit errors.
+8. Check all discovered devices keep updating over a full day without request-limit errors.
    Then repair automations to handle unavailable temperature readings explicitly;
    existing float(99)/float(0) fallbacks are still unsuitable readiness checks.
 

@@ -37,21 +37,21 @@ Once the add-on is running, a new entity will appear under your MQTT integration
 
 Since 1.3.4, Python bridge logs use UTC ISO 8601 timestamps with milliseconds
 and a severity level. Match these to Home Assistant history by converting UTC
-to your local timezone (Sydney daylight time is UTC+11).
+to the timezone used by your Home Assistant instance.
 
 Each HTTP attempt logs the method, endpoint, HTTP status and elapsed seconds.
 Device requests include the boiler name and serial. HTTP 200 means a response
 arrived; a following `[STATUS] ... failed` still means its contents were rejected.
 Request/response bodies, credentials, tokens and raw request exceptions are not logged.
 
-For example, a failed status poll followed by recovery looks like:
+The following example uses synthetic timestamps and device identifiers:
 
 ```code
-2026-11-15T00:52:08.936Z INFO [HTTP] Extension (example-serial) GET /status; status=200 duration=0.825s reason=response received
-2026-11-15T00:52:08.937Z WARNING [AVAILABILITY] Extension (example-serial): data unavailable
-2026-11-15T00:52:08.937Z WARNING [STATUS] Extension (example-serial): failed: unsuccessful or malformed cloud response / invalid value
-2026-11-15T00:57:11.419Z INFO [HTTP] Extension (example-serial) GET /status; status=200 duration=0.740s reason=response received
-2026-11-15T00:57:11.420Z INFO [RECOVERY] Extension (example-serial): fresh status received; data unavailable for 302.5s
+2000-01-01T12:00:00.936Z INFO [HTTP] Example Boiler (example-serial) GET /status; status=200 duration=0.825s reason=response received
+2000-01-01T12:00:00.937Z WARNING [AVAILABILITY] Example Boiler (example-serial): data unavailable
+2000-01-01T12:00:00.937Z WARNING [STATUS] Example Boiler (example-serial): failed: unsuccessful or malformed cloud response / invalid value
+2000-01-01T12:05:03.419Z INFO [HTTP] Example Boiler (example-serial) GET /status; status=200 duration=0.740s reason=response received
+2000-01-01T12:05:03.420Z INFO [RECOVERY] Example Boiler (example-serial): fresh status received; data unavailable for 302.5s
 ```
 
 Availability/recovery messages appear once per transition, including startup and
@@ -59,6 +59,12 @@ MQTT reconnection. The duration starts when this process publishes the first
 offline state, uses a monotonic clock, and does not survive a bridge restart.
 It measures unavailable bridge data, not a confirmed physical heater outage.
 Container service-manager output may keep its own format.
+
+The bridge discovers the account's devices dynamically; no household layout or
+device count is assumed. Documentation examples and test fixtures are synthetic.
+Runtime logs stay in your installation and include configured device names and
+serials for troubleshooting. Redact these identifiers and other private data
+before sharing logs publicly.
 
 ## Known to work on:
 

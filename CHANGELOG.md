@@ -4,9 +4,8 @@
 
 - Decode Anti-Legionella Active from WaterHeaterSts bit 0x08 instead of
   leaving the sensor unknown while waiting for a Cmd change.
-- Main's observed cycle cleared this flag at 18:55:45 Sydney on 15 November;
-  Cmd remained Auto (17). This mapping is inferred from firmware 07.00.09.06
-  telemetry correlated with the user's observed cycle, not vendor documentation.
+- This mapping is inferred from telemetry on firmware 07.00.09.06, not vendor
+  documentation. Its behavior on other firmware versions requires validation.
 - Keep operating mode and heating status independent of the cycle flag.
 - Preserve MQTT discovery identities and unknown state for older retained
   payloads missing the derived field. Add regression tests for the observed
