@@ -1,5 +1,5 @@
 import sys, json, time, uuid, os, requests, urllib3, datetime
-import math, queue
+import math, queue, logging
 from email.utils import parsedate_to_datetime
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
@@ -14,6 +14,42 @@ MQTT_HOST = os.getenv("MQTT_HOST", "core-mosquitto")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 MQTT_USER = os.getenv("MQTT_USER")
 MQTT_PASS = os.getenv("MQTT_PASSWORD")
+
+LOGGER = logging.getLogger("thermowatt_bridge")
+
+
+class UTCFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        return datetime.datetime.fromtimestamp(
+            record.created, datetime.timezone.utc
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def configure_logging():
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(UTCFormatter("%(asctime)s %(levelname)s %(message)s"))
+    LOGGER.handlers.clear()
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+
+
+def failure_reason(exc):
+    # Do not log raw request exceptions: URLs, headers and bodies can contain secrets.
+    if isinstance(exc, requests.Timeout):
+        return "request timed out"
+    if isinstance(exc, requests.ConnectionError):
+        return "connection failed"
+    if isinstance(exc, requests.HTTPError):
+        return "HTTP error"
+    if isinstance(exc, ValueError):
+        return "unsuccessful or malformed cloud response / invalid value"
+    if isinstance(exc, KeyError):
+        return "required response field missing"
+    if isinstance(exc, RuntimeError):
+        return "cloud request paused or rate limited"
+    return type(exc).__name__
+
 
 class MyThermowattBridge:
     API_KEY = "YVjArWssxKH631jv1dnnWOTr6gijsSAGz7rQJ4hJoUNRffxYvbQaMbePBEZalena"
@@ -41,6 +77,8 @@ class MyThermowattBridge:
         self.phase = "starting"
         self.last_health_publish = 0
         self.last_pause_log = 0
+        self._availability_state = {}
+        self._unavailable_since = {}
         self.mqtt_client.will_set("thermowatt/bridge/availability", "offline", retain=True)
         self.mqtt_client.on_connect = self.on_connect
 
@@ -91,7 +129,7 @@ class MyThermowattBridge:
             "password": PASSWORD,
             "device_id": self.config["device_uuid"]
         }
-        r = self.session.post(f"{self.BASE_URL}/login", json=payload, verify=False, timeout=(10, 30))
+        r = self._send_request("POST", "/login", auth=True, json=payload)
         res = self._validate(r)['result']
         self._update_auth(res['accessToken'], res['refreshToken'])
 
@@ -101,7 +139,7 @@ class MyThermowattBridge:
         self._reset_headers()
         self.session.headers["x-api-key"] = self.API_KEY
         payload = {"username": EMAIL, "refreshToken": self.config["refresh_token"]}
-        r = self.session.post(f"{self.BASE_URL}/refresh", json=payload, verify=False, timeout=(10, 30))
+        r = self._send_request("POST", "/refresh", auth=True, json=payload)
         if r.status_code == 200:
             res = self._validate(r)['result']
             self._update_auth(res['accessToken'], res['refreshToken'])
@@ -123,6 +161,47 @@ class MyThermowattBridge:
     def availability(self, serial, available):
         self.mqtt_client.publish(f"P/{serial}/availability",
                                  "online" if available else "offline", retain=True)
+        previous = self._availability_state.get(serial)
+        self._availability_state[serial] = available
+        if not available and previous is not False:
+            self._unavailable_since[serial] = time.monotonic()
+            LOGGER.warning("[AVAILABILITY] %s: data unavailable", self._device_label(serial))
+        elif available and previous is not True:
+            since = self._unavailable_since.pop(serial, None)
+            if since is None:
+                LOGGER.info("[AVAILABILITY] %s: data available", self._device_label(serial))
+            else:
+                LOGGER.info("[RECOVERY] %s: fresh status received; data unavailable for %.1fs",
+                            self._device_label(serial), time.monotonic() - since)
+
+    def _device_label(self, serial):
+        name = self.config.get("devices", {}).get(serial, {}).get("name", "Boiler")
+        return f"{str(name).replace(chr(10), ' ').replace(chr(13), ' ')} ({serial})"
+
+    def _send_request(self, method, endpoint, serial=None, auth=False, **kwargs):
+        """Log each HTTP attempt, including auth retries, without request/response bodies."""
+        started = time.monotonic()
+        status = "none"
+        reason = "transport error"
+        level = logging.WARNING
+        try:
+            kwargs.setdefault("timeout", (10, 30))
+            if auth:
+                response = self.session.post(f"{self.BASE_URL}{endpoint}", verify=False, **kwargs)
+            else:
+                response = self.session.request(method, f"{self.BASE_URL}{endpoint}",
+                                                verify=False, **kwargs)
+            status = response.status_code
+            reason = "response received" if status < 400 else "HTTP error"
+            level = logging.INFO if status < 400 else logging.WARNING
+            return response
+        except Exception as exc:
+            reason = failure_reason(exc)
+            raise
+        finally:
+            LOGGER.log(level, "[HTTP] %s %s %s; status=%s duration=%.3fs reason=%s",
+                       self._device_label(serial) if serial else "Bridge", method, endpoint,
+                       status, time.monotonic() - started, reason)
 
     def _pause(self, seconds, reason="bridge_error"):
         until = time.time() + seconds
@@ -185,8 +264,9 @@ class MyThermowattBridge:
             self.last_health_publish = current
         if paused and (force or current - self.last_pause_log >= self.STATUS_LOG_INTERVAL):
             retry = datetime.datetime.fromtimestamp(until, datetime.timezone.utc).isoformat()
-            print(f"[COOLDOWN] Bridge alive; no cloud requests. Reason={self.config.get('cooldown_reason', 'saved_cloud_cooldown')}; "
-                  f"retry at {retry}; {max(0, int(until-current))}s remaining", flush=True)
+            LOGGER.info("[COOLDOWN] Bridge alive; no cloud requests. Reason=%s; retry at %s; %ss remaining",
+                        self.config.get('cooldown_reason', 'saved_cloud_cooldown'), retry,
+                        max(0, int(until-current)))
             self.last_pause_log = current
 
     def _validate(self, response):
@@ -224,14 +304,12 @@ class MyThermowattBridge:
         if serial:
             self.session.headers["seriale"] = serial
         kwargs.setdefault("timeout", (10, 30))
-        response = self.session.request(method, f"{self.BASE_URL}{endpoint}",
-                                        verify=False, **kwargs)
+        response = self._send_request(method, endpoint, serial=serial, **kwargs)
         if response.status_code == 401 and self.refresh_session():
             self._reset_headers()
             if serial:
                 self.session.headers["seriale"] = serial
-            response = self.session.request(method, f"{self.BASE_URL}{endpoint}",
-                                            verify=False, **kwargs)
+            response = self._send_request(method, endpoint, serial=serial, **kwargs)
         self._validate(response)
         return response
 
@@ -471,11 +549,11 @@ class MyThermowattBridge:
             if serial not in self.config.get("devices", {}) or command not in {"TEMP", "MODE"}:
                 return
             if time.time() < self.config.get("blocked_until", 0):
-                print("[CMD] Rejected while cloud requests are paused")
+                LOGGER.warning("[CMD] %s: rejected while cloud requests are paused", self._device_label(serial))
                 return
             self.commands.put_nowait((serial, command, msg.payload.decode()))
         except (UnicodeDecodeError, queue.Full):
-            print("[CMD] Invalid payload or command queue full")
+            LOGGER.warning("[CMD] Invalid payload or command queue full")
 
     def process_command(self, serial, command, payload):
         device = self.config["devices"][serial]
@@ -500,10 +578,10 @@ class MyThermowattBridge:
             self._save_config()
             # Allow the cloud time to reflect the command, without blocking MQTT.
             self.pending_commands[serial] = time.time() + 20
-            print(f"[CMD] Accepted for {serial}; waiting for a real status update")
+            LOGGER.info("[CMD] %s: accepted; waiting for a real status update", self._device_label(serial))
         except Exception as exc:
             self.availability(serial, False)
-            print(f"[CMD] Failed for {serial}: {exc}")
+            LOGGER.warning("[CMD] %s: failed: %s", self._device_label(serial), failure_reason(exc))
 
     def poll_status(self, serial):
         try:
@@ -524,7 +602,7 @@ class MyThermowattBridge:
             return True
         except Exception as exc:
             self.availability(serial, False)
-            print(f"[STATUS] Failed for {serial}: {exc}")
+            LOGGER.warning("[STATUS] %s: failed: %s", self._device_label(serial), failure_reason(exc))
             return False
 
     # -------------------------------------------------------------------------
@@ -573,8 +651,8 @@ class MyThermowattBridge:
     def log_status_summary(self):
         elapsed = time.time() - self.last_status_log_time
         if elapsed >= self.STATUS_LOG_INTERVAL:
-            print(f"[STATUS] Polled {self.poll_count} times, "
-                  f"got {self.success_count} x 200, {self.error_count} errors")
+            LOGGER.info("[STATUS] Polled %s times, %s valid status updates, %s errors",
+                        self.poll_count, self.success_count, self.error_count)
             self.poll_count = 0
             self.success_count = 0
             self.error_count = 0
@@ -650,7 +728,7 @@ class MyThermowattBridge:
                             next_poll = time.time() + self.POLL_INTERVAL
                     self.log_status_summary()
                 except Exception as exc:
-                    print(f"[BRIDGE] {exc}")
+                    LOGGER.error("[BRIDGE] %s", failure_reason(exc))
                     self._pause(self.POLL_INTERVAL)
                 time.sleep(1)
         except KeyboardInterrupt:
@@ -662,5 +740,8 @@ class MyThermowattBridge:
 
 
 if __name__ == "__main__":
+    configure_logging()
+    LOGGER.info("[BRIDGE] Starting Thermowatt Bridge")
     bridge = MyThermowattBridge()
     bridge.run()
+

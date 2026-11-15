@@ -17,6 +17,5 @@ MQTT_PORT="$(bashio::services mqtt "port")"
 MQTT_USER="$(bashio::services mqtt "username")"
 MQTT_PASSWORD="$(bashio::services mqtt "password")"
 
-bashio::log.info "Starting Thermowatt Bridge for $EMAIL..."
-
 python3 -u /thermowatt_bridge.py "$EMAIL" "$PASSWORD"
+
