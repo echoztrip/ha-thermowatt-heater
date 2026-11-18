@@ -324,6 +324,79 @@ class BridgeTests(unittest.TestCase):
                 self.assertFalse(self.publications('/STATUS'))
                 self.assertEqual(self.publications('/availability')[-1].args[1], 'offline')
 
+    def fault_status(self, nv='2', volatile='0', firmware='07.00.09.06'):
+        body = self.valid()
+        body['result'].update(NonVolatileErrors=nv, VolatileErrors=volatile,
+                              Tmec_SW_Version=firmware, Cmd='8', WaterHeaterSts='32')
+        return body
+
+    def test_ambient_pause_publishes_explanation_without_changing_mode_or_raw_flags(self):
+        self.b.session.request.return_value = response(self.fault_status())
+        self.assertTrue(self.b.poll_status('fixture_a'))
+        result = json.loads(self.publications('/STATUS')[-1].args[1])['result']
+        self.assertEqual(result['device_error_status'], 'high_ambient_temperature_pause')
+        self.assertTrue(result['high_ambient_temperature_pause'])
+        self.assertEqual(result['device_error_mapping'], 'observed_firmware')
+        self.assertEqual(result['NonVolatileErrors'], '2')
+        self.assertEqual(result['Cmd'], '8')
+        self.assertFalse(result['heating'])
+        self.assertIn('resume automatically', result['device_error_message'])
+        self.assertEqual(self.b.session.request.call_count, 1)
+        self.assertEqual(self.b.session.request.call_args.args[0], 'GET')
+
+    def test_ambient_pause_and_clear_logged_once_per_transition_and_per_device(self):
+        with self.assertLogs(bridge.LOGGER, level='INFO') as logs:
+            self.b.session.request.return_value = response(self.fault_status())
+            self.b.poll_status('fixture_a')
+            self.b.poll_status('fixture_a')
+            self.b.poll_status('fixture_b')
+            self.b.session.request.return_value = response(self.fault_status(nv='0'))
+            self.b.poll_status('fixture_a')
+            self.b.poll_status('fixture_a')
+        lines = [line for line in logs.output if '[DEVICE]' in line]
+        self.assertEqual(len(lines), 3)
+        self.assertIn('device error flags cleared', lines[-1])
+
+    def test_unknown_firmware_does_not_label_error_two_as_ambient_pause(self):
+        decoded = bridge.device_error_diagnostics(self.fault_status(firmware='99.00')['result'])
+        self.assertEqual(decoded['device_error_status'], 'unmapped_device_error')
+        self.assertIsNone(decoded['high_ambient_temperature_pause'])
+        self.assertEqual(decoded['unmapped_non_volatile_errors'], 2)
+
+    def test_unknown_bits_are_preserved_even_with_known_ambient_pause(self):
+        decoded = bridge.device_error_diagnostics(self.fault_status(nv='6', volatile='8')['result'])
+        self.assertEqual(decoded['device_error_status'], 'unmapped_device_error')
+        self.assertTrue(decoded['high_ambient_temperature_pause'])
+        self.assertEqual(decoded['unmapped_non_volatile_errors'], 4)
+        self.assertEqual(decoded['unmapped_volatile_errors'], 8)
+
+    def test_volatile_error_two_is_not_the_observed_nonvolatile_pause_bit(self):
+        decoded = bridge.device_error_diagnostics(self.fault_status(nv='0', volatile='2')['result'])
+        self.assertEqual(decoded['device_error_status'], 'unmapped_device_error')
+        self.assertFalse(decoded['high_ambient_temperature_pause'])
+
+    def test_missing_or_invalid_error_flags_do_not_claim_healthy(self):
+        for bad in (None, True, -1, 'nan', '2.0', 2.5, {}, '٢'):
+            with self.subTest(bad=bad):
+                decoded = bridge.device_error_diagnostics(self.fault_status(nv=bad)['result'])
+                self.assertEqual(decoded['device_error_status'], 'unknown_error_status')
+        self.assertEqual(bridge.device_error_diagnostics({})['device_error_status'], 'unknown_error_status')
+
+    def test_clear_error_status_is_not_a_claim_of_heating(self):
+        decoded = bridge.device_error_diagnostics(self.fault_status(nv='0')['result'])
+        self.assertEqual(decoded['device_error_status'], 'ok')
+        self.assertFalse(decoded['high_ambient_temperature_pause'])
+
+    def test_error_diagnostics_discovery_uses_existing_status_topic(self):
+        self.b.publish_discovery('fixture_a', 'Fixture A')
+        configs = [json.loads(c.args[1]) for c in self.publications('/config')]
+        for suffix in ('device_error_status', 'device_error_message'):
+            config = next(c for c in configs if c['unique_id'].endswith(suffix))
+            self.assertEqual(config['state_topic'], 'P/fixture_a/STATUS')
+            self.assertEqual(config['entity_category'], 'diagnostic')
+            self.assertEqual(config['availability_mode'], 'all')
+        self.b.session.request.assert_not_called()
+
     def test_saved_cooldown_publishes_heartbeat_and_retry_without_cloud_io(self):
         self.b.config['blocked_until'] = bridge.time.time() + 3600
         self.b.publish_bridge_health(force=True)
@@ -395,3 +468,4 @@ class BridgeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.fixture_a()
+
