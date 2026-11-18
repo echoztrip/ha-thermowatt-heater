@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.6
+
+- Add readable device-error status and explanation sensors using the existing status poll.
+- Identify the high ambient temperature heating pause observed on thermostat firmware 07.00.09.06, with automatic recovery guidance.
+- Preserve raw flags and report unmapped or missing errors without guessing their meaning on other firmware.
+- Log device-error changes and recovery once per transition; leave heater protection, operating mode and polling unchanged.
+
 ## 1.3.5
 
 - Fix the Anti-Legionella Active indicator using the heater status flag; the mapping is inferred from firmware telemetry and needs validation on other firmware.
@@ -58,3 +65,4 @@
 
 - Add cloud connectivity, temperature monitoring and mode control.
 - Add MQTT device discovery in Home Assistant.
+
