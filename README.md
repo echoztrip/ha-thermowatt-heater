@@ -66,6 +66,40 @@ Runtime logs stay in your installation and include configured device names and
 serials for troubleshooting. Redact these identifiers and other private data
 before sharing logs publicly.
 
+## Device errors and temporary heating pauses
+
+Version 1.3.6 adds **Device Error Status** and **Device Error Message** diagnostic
+sensors for each discovered heater. The same fields are also attributes on the
+water-heater entity. They use the existing status poll and normal device availability;
+they do not send commands or request extra cloud updates.
+
+`high_ambient_temperature_pause` means the observed protection flag indicates that
+heating is temporarily paused while the electronics cool. The heater should resume
+automatically when conditions normalize. Do not repeatedly restart it or force heating.
+The manufacturer's [owner's guide](https://www.thermann.com.au/thermann-cms/files/Thermann-Smart_Electric-Owners_Guide.pdf)
+describes this protective pause under its service guidance.
+
+The protocol mapping is **observed, not vendor documented**: non-volatile flag 0x02
+was correlated with the vendor app's high-ambient message on thermostat firmware
+`07.00.09.06`. It is not a mapping to the app's E2 error code and does not use a guessed
+ambient-temperature cutoff. Other firmware and error bits remain unmapped.
+
+Diagnostic values:
+
+- `ok`: both device error masks are valid and zero; this does not mean heating is on.
+- `high_ambient_temperature_pause`: only the observed pause flag is set.
+- `unmapped_device_error`: other error bits or unsupported-firmware flags are present;
+  check the vendor app for the actual explanation.
+- `unknown_error_status`: either mask is missing or malformed; do not assume healthy.
+
+`NonVolatileErrors` and `VolatileErrors` are preserved unchanged. Additional attributes
+include `high_ambient_temperature_pause` (true/false, or null when unverified),
+`unmapped_non_volatile_errors`, `unmapped_volatile_errors` and `device_error_mapping`.
+When known and unknown bits coexist, the status remains `unmapped_device_error` so
+the known pause cannot hide an additional problem. Device-error pause/recovery logs
+are separate from bridge connectivity, API rate-limit cooldown and heating status.
+Automations should honor heater protection and avoid retrying settings during a pause.
+
 ## Known to work on:
 
 - **Home Assistant:**
@@ -90,4 +124,5 @@ _Disclaimer: This project is not affiliated with or endorsed by Thermowatt or Ar
 If this add-on saved you some frustration or made your home a bit smarter or helped someone avoid a cold shower, feel free to [buy me a beer on Ko-fi!](https://ko-fi.com/thermohacker)
 
 [![support](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/thermohacker)
+
 

@@ -51,6 +51,55 @@ def failure_reason(exc):
     return type(exc).__name__
 
 
+def error_mask(value):
+    """Accept only non-negative integer masks; missing data is not zero."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isascii() and value.isdecimal():
+        return int(value)
+    return None
+
+
+def device_error_diagnostics(result):
+    """Interpret observed flags without inventing vendor E/I error codes.
+
+    NonVolatileErrors bit0x02 coincided with the vendor app's high-ambient
+    pause on thermostat firmware07.00.09.06. This is an observed mapping,
+    not a documented cross-firmware protocol. Other bits remain unmapped.
+    """
+    nv = error_mask(result.get('NonVolatileErrors'))
+    volatile = error_mask(result.get('VolatileErrors'))
+    known_firmware = result.get('Tmec_SW_Version') == '07.00.09.06'
+    pause = bool(nv & 0x02) if known_firmware and nv is not None else None
+    unmapped_nv = nv & ~0x02 if known_firmware and nv is not None else nv
+    if nv is None or volatile is None:
+        status = 'unknown_error_status'
+        message = 'Device error flags missing or invalid; check the vendor app.'
+    elif unmapped_nv or volatile:
+        status = 'unmapped_device_error'
+        message = 'Unmapped device error flags; check the vendor app for details.'
+        if pause:
+            message += ' A high ambient temperature pause is also indicated.'
+    elif pause:
+        status = 'high_ambient_temperature_pause'
+        message = ('Heating temporarily paused due to high ambient temperature. '
+                   'The heater should resume automatically as conditions normalize. '
+                   'Do not repeatedly restart it or force heating.')
+    else:
+        status = 'ok'
+        message = 'No device error flags reported.'
+    return {
+        'device_error_status': status,
+        'device_error_message': message,
+        'high_ambient_temperature_pause': pause,
+        'unmapped_non_volatile_errors': unmapped_nv,
+        'unmapped_volatile_errors': volatile,
+        'device_error_mapping': 'observed_firmware' if known_firmware else 'unverified_firmware',
+    }
+
+
 class MyThermowattBridge:
     API_KEY = "YVjArWssxKH631jv1dnnWOTr6gijsSAGz7rQJ4hJoUNRffxYvbQaMbePBEZalena"
     BASE_URL = "https://myapp-connectivity.com/api/v1"
@@ -79,6 +128,7 @@ class MyThermowattBridge:
         self.last_pause_log = 0
         self._availability_state = {}
         self._unavailable_since = {}
+        self._device_error_state = {}
         self.mqtt_client.will_set("thermowatt/bridge/availability", "offline", retain=True)
         self.mqtt_client.on_connect = self.on_connect
 
@@ -478,6 +528,21 @@ class MyThermowattBridge:
             entity_category="diagnostic"
         )
 
+        self._pub_sensor(
+            serial, name,
+            "device_error_status", "Device Error Status",
+            "{{ value_json.result.device_error_status | default('unknown_error_status') }}",
+            icon="mdi:information-outline",
+            entity_category="diagnostic"
+        )
+        self._pub_sensor(
+            serial, name,
+            "device_error_message", "Device Error Message",
+            "{{ value_json.result.device_error_message | default('Error details unavailable') }}",
+            icon="mdi:text-box-outline",
+            entity_category="diagnostic"
+        )
+
         # ── Binary diagnostic sensors ─────────────────────────────────────────
         self._pub_binary(
             serial, name,
@@ -591,6 +656,20 @@ class MyThermowattBridge:
                     raise ValueError(f"Invalid {key}")
             result["heating"] = bool(int(result["WaterHeaterSts"]) & 1)
             result["anti_legionella_active"] = bool(int(result["WaterHeaterSts"]) & 0x08)
+            result.update(device_error_diagnostics(result))
+            error_state = (result['device_error_status'],
+                           error_mask(result.get('NonVolatileErrors')),
+                           error_mask(result.get('VolatileErrors')),
+                           result.get('Tmec_SW_Version'))
+            previous = self._device_error_state.get(serial)
+            if error_state != previous:
+                self._device_error_state[serial] = error_state
+                if result['device_error_status'] != 'ok':
+                    LOGGER.warning('[DEVICE] %s: %s; nv=%s volatile=%s mapping=%s',
+                                   self._device_label(serial), result['device_error_message'],
+                                   error_state[1], error_state[2], result['device_error_mapping'])
+                elif previous is not None and previous[0] != 'ok':
+                    LOGGER.info('[DEVICE] %s: device error flags cleared', self._device_label(serial))
             result["last_successful_update"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             self.config["devices"][serial]["last_setpoint"] = int(float(result["T_SetPoint"]))
             self._save_config()
@@ -741,3 +820,4 @@ if __name__ == "__main__":
     LOGGER.info("[BRIDGE] Starting Thermowatt Bridge")
     bridge = MyThermowattBridge()
     bridge.run()
+
